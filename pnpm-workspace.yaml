@@ -1,0 +1,7 @@
+packages:
+  - apps/*
+
+# Approve build scripts for native deps. Without this, pnpm 11 refuses to run
+# any command in the workspace when these packages have un-approved postinstall.
+allowBuilds:
+  esbuild: true

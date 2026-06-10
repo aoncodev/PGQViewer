@@ -1,0 +1,339 @@
+@import "tailwindcss";
+
+/* Manual theme switching: `<html data-theme="light|dark">`. Tailwind v4's
+   default dark: variant relies on `prefers-color-scheme`; we override so
+   the user controls the theme. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/* Semantic color tokens. Light values shipped via :root; dark variant
+   overrides via [data-theme="dark"]. Default theme is dark (the existing
+   experience); the toggle persists choice in localStorage. */
+:root {
+  --bg: oklch(0.985 0.002 240);
+  --surface: oklch(0.97 0.004 240);
+  --surface-2: oklch(0.93 0.005 240);
+  --border: oklch(0.88 0.006 240);
+  --border-strong: oklch(0.80 0.008 240);
+  --fg: oklch(0.22 0.02 240);
+  --fg-muted: oklch(0.46 0.02 240);
+  --fg-subtle: oklch(0.62 0.015 240);
+  /* Accent tokens default to Blue (≈ Tailwind blue-600 #2563EB — the de
+     facto standard interactive accent); [data-palette="..."] rules below
+     override them for the other palettes. */
+  --accent: oklch(0.55 0.21 263);
+  --accent-hover: oklch(0.60 0.21 263);
+  --accent-fg: oklch(0.99 0 0);
+  --focus-ring: oklch(0.55 0.21 263 / 0.5);
+  --selection-bg: oklch(0.55 0.21 263 / 0.30);
+  --danger: oklch(0.55 0.22 25);
+  --danger-bg: oklch(0.96 0.04 25);
+  --danger-fg: oklch(0.35 0.18 25);
+  --warning: oklch(0.78 0.16 75);
+  --canvas-bg: oklch(0.97 0.003 240);
+  --node-stroke: oklch(0.99 0 0);
+  --edge-color: oklch(0.58 0.02 240);
+  --edge-label-bg: oklch(0.99 0 0);
+  --label-text: oklch(0.20 0.02 240);
+  --label-outline: oklch(0.99 0 0);
+}
+
+[data-theme="dark"] {
+  --bg: oklch(0.155 0.018 240);
+  --surface: oklch(0.205 0.018 240);
+  --surface-2: oklch(0.245 0.018 240);
+  --border: oklch(0.28 0.018 240);
+  --border-strong: oklch(0.38 0.02 240);
+  --fg: oklch(0.94 0.005 240);
+  --fg-muted: oklch(0.66 0.012 240);
+  --fg-subtle: oklch(0.50 0.012 240);
+  --accent: oklch(0.66 0.18 260);
+  --accent-hover: oklch(0.72 0.18 260);
+  --accent-fg: oklch(0.99 0 0);
+  --focus-ring: oklch(0.66 0.18 260 / 0.5);
+  --selection-bg: oklch(0.66 0.18 260 / 0.30);
+  --danger: oklch(0.70 0.22 25);
+  --danger-bg: oklch(0.25 0.06 25);
+  --danger-fg: oklch(0.90 0.06 25);
+  --warning: oklch(0.82 0.16 75);
+  --canvas-bg: oklch(0.12 0.02 240);
+  --node-stroke: oklch(0.155 0.018 240);
+  --edge-color: oklch(0.55 0.02 240);
+  --edge-label-bg: oklch(0.155 0.018 240);
+  --label-text: oklch(0.96 0.005 240);
+  --label-outline: oklch(0.155 0.018 240);
+}
+
+/* ===== Accent palettes ====================================================
+   Each palette overrides accent / accent-hover / accent-fg / focus-ring /
+   selection-bg only. Surface, fg, border, danger, warning, canvas — all
+   stay tied to the active light/dark theme so the two settings compose
+   freely.
+
+   Nine modern hues:
+     blue (default) · indigo · sky · emerald · amber · orange · rose ·
+     fuchsia · violet.
+
+   Lightness / chroma split:
+     - "deep" palettes (indigo, emerald, orange, rose, fuchsia, violet) sit
+       at L ≈ 0.55-0.65 light / 0.68-0.74 dark, chroma 0.14-0.21, with
+       white text on the accent.
+     - "warm light" palette (amber) sits higher at L ≈ 0.78 with dark text
+       so amber buttons stay readable.
+     - sky sits in between; dark text in light mode keeps the airy feel,
+       white text in dark mode.
+
+   Dark-mode variants brighten the accent by ~0.10 lightness so it still
+   pops against the dark surface tokens. */
+
+[data-palette="blue"] {
+  --accent: oklch(0.55 0.21 263);
+  --accent-hover: oklch(0.60 0.21 263);
+  --accent-fg: oklch(0.99 0 0);
+  --focus-ring: oklch(0.55 0.21 263 / 0.5);
+  --selection-bg: oklch(0.55 0.21 263 / 0.30);
+}
+[data-theme="dark"][data-palette="blue"] {
+  --accent: oklch(0.66 0.18 260);
+  --accent-hover: oklch(0.72 0.18 260);
+  --focus-ring: oklch(0.66 0.18 260 / 0.5);
+  --selection-bg: oklch(0.66 0.18 260 / 0.30);
+}
+
+[data-palette="indigo"] {
+  --accent: oklch(0.55 0.18 265);
+  --accent-hover: oklch(0.60 0.18 265);
+  --accent-fg: oklch(0.99 0 0);
+  --focus-ring: oklch(0.55 0.18 265 / 0.5);
+  --selection-bg: oklch(0.55 0.18 265 / 0.30);
+}
+[data-theme="dark"][data-palette="indigo"] {
+  --accent: oklch(0.68 0.17 265);
+  --accent-hover: oklch(0.74 0.17 265);
+  --focus-ring: oklch(0.68 0.17 265 / 0.5);
+  --selection-bg: oklch(0.68 0.17 265 / 0.30);
+}
+
+[data-palette="sky"] {
+  --accent: oklch(0.68 0.13 225);
+  --accent-hover: oklch(0.73 0.13 225);
+  --accent-fg: oklch(0.20 0.03 225);
+  --focus-ring: oklch(0.68 0.13 225 / 0.5);
+  --selection-bg: oklch(0.68 0.13 225 / 0.30);
+}
+[data-theme="dark"][data-palette="sky"] {
+  --accent: oklch(0.74 0.13 225);
+  --accent-hover: oklch(0.79 0.13 225);
+  --accent-fg: oklch(0.18 0.03 225);
+  --focus-ring: oklch(0.74 0.13 225 / 0.5);
+  --selection-bg: oklch(0.74 0.13 225 / 0.30);
+}
+
+[data-palette="emerald"] {
+  --accent: oklch(0.62 0.14 155);
+  --accent-hover: oklch(0.67 0.14 155);
+  --accent-fg: oklch(0.99 0 0);
+  --focus-ring: oklch(0.62 0.14 155 / 0.5);
+  --selection-bg: oklch(0.62 0.14 155 / 0.30);
+}
+[data-theme="dark"][data-palette="emerald"] {
+  --accent: oklch(0.72 0.14 155);
+  --accent-hover: oklch(0.77 0.14 155);
+  --focus-ring: oklch(0.72 0.14 155 / 0.5);
+  --selection-bg: oklch(0.72 0.14 155 / 0.30);
+}
+
+[data-palette="amber"] {
+  --accent: oklch(0.78 0.16 80);
+  --accent-hover: oklch(0.82 0.16 80);
+  --accent-fg: oklch(0.22 0.03 80);
+  --focus-ring: oklch(0.78 0.16 80 / 0.5);
+  --selection-bg: oklch(0.78 0.16 80 / 0.30);
+}
+[data-theme="dark"][data-palette="amber"] {
+  --accent: oklch(0.82 0.16 80);
+  --accent-hover: oklch(0.86 0.16 80);
+  --accent-fg: oklch(0.18 0.03 80);
+  --focus-ring: oklch(0.82 0.16 80 / 0.5);
+  --selection-bg: oklch(0.82 0.16 80 / 0.30);
+}
+
+[data-palette="orange"] {
+  --accent: oklch(0.65 0.18 45);
+  --accent-hover: oklch(0.70 0.18 45);
+  --accent-fg: oklch(0.99 0 0);
+  --focus-ring: oklch(0.65 0.18 45 / 0.5);
+  --selection-bg: oklch(0.65 0.18 45 / 0.30);
+}
+[data-theme="dark"][data-palette="orange"] {
+  --accent: oklch(0.74 0.17 45);
+  --accent-hover: oklch(0.79 0.17 45);
+  --focus-ring: oklch(0.74 0.17 45 / 0.5);
+  --selection-bg: oklch(0.74 0.17 45 / 0.30);
+}
+
+[data-palette="rose"] {
+  --accent: oklch(0.62 0.20 10);
+  --accent-hover: oklch(0.67 0.20 10);
+  --accent-fg: oklch(0.99 0 0);
+  --focus-ring: oklch(0.62 0.20 10 / 0.5);
+  --selection-bg: oklch(0.62 0.20 10 / 0.30);
+}
+[data-theme="dark"][data-palette="rose"] {
+  --accent: oklch(0.72 0.19 10);
+  --accent-hover: oklch(0.77 0.19 10);
+  --focus-ring: oklch(0.72 0.19 10 / 0.5);
+  --selection-bg: oklch(0.72 0.19 10 / 0.30);
+}
+
+[data-palette="fuchsia"] {
+  --accent: oklch(0.62 0.21 325);
+  --accent-hover: oklch(0.67 0.21 325);
+  --accent-fg: oklch(0.99 0 0);
+  --focus-ring: oklch(0.62 0.21 325 / 0.5);
+  --selection-bg: oklch(0.62 0.21 325 / 0.30);
+}
+[data-theme="dark"][data-palette="fuchsia"] {
+  --accent: oklch(0.72 0.20 325);
+  --accent-hover: oklch(0.77 0.20 325);
+  --focus-ring: oklch(0.72 0.20 325 / 0.5);
+  --selection-bg: oklch(0.72 0.20 325 / 0.30);
+}
+
+[data-palette="violet"] {
+  --accent: oklch(0.55 0.20 285);
+  --accent-hover: oklch(0.60 0.20 285);
+  --accent-fg: oklch(0.99 0 0);
+  --focus-ring: oklch(0.55 0.20 285 / 0.5);
+  --selection-bg: oklch(0.55 0.20 285 / 0.30);
+}
+[data-theme="dark"][data-palette="violet"] {
+  --accent: oklch(0.68 0.18 285);
+  --accent-hover: oklch(0.74 0.18 285);
+  --focus-ring: oklch(0.68 0.18 285 / 0.5);
+  --selection-bg: oklch(0.68 0.18 285 / 0.30);
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-fg: var(--fg);
+  --color-fg-muted: var(--fg-muted);
+  --color-fg-subtle: var(--fg-subtle);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-fg: var(--accent-fg);
+  --color-danger: var(--danger);
+  --color-danger-bg: var(--danger-bg);
+  --color-danger-fg: var(--danger-fg);
+  --color-warning: var(--warning);
+}
+
+html,
+body {
+  background-color: var(--bg);
+  color: var(--fg);
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+}
+
+/* Tailwind v4 preflight stops setting cursor: pointer on <button>. Re-add
+   it globally so every clickable surface — graph picker, schema rows,
+   colour swatches, layout selector buttons, expand pills — signals
+   clickability without per-component spot fixes. Disabled buttons keep
+   the default arrow. */
+button:not(:disabled),
+[role="button"]:not([aria-disabled="true"]) {
+  cursor: pointer;
+}
+
+/* Cytoscape host: positioned container required for the canvas to size. */
+.cy-host {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  background-color: var(--canvas-bg);
+}
+
+/* Selection highlight follows the active accent palette. */
+::selection {
+  background-color: var(--selection-bg);
+}
+
+/* Thinner, more refined scrollbars across the app. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background-color: var(--border);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  border-radius: 999px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background-color: var(--border-strong);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
+
+/* Modal / overlay entry animation. The CommandPalette overlay carries the
+   role="dialog"[aria-modal] markers below; we target it generically. */
+@keyframes pgv-overlay-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes pgv-pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+[role="dialog"][aria-modal] {
+  animation: pgv-overlay-in 120ms ease-out;
+}
+
+[role="dialog"][aria-modal] > * {
+  animation: pgv-pop-in 160ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* Keep the inner SqlEditor and child popovers from inheriting the dialog
+   pop-in (looks twitchy and causes a flash on mount). */
+[role="dialog"][aria-modal] .cm-editor,
+[role="dialog"][aria-modal] [role="listbox"],
+[role="dialog"][aria-modal] [role="option"] {
+  animation: none;
+}
+
+/* Reserve a focus ring style we can apply by class instead of repeating the
+   long Tailwind chain. */
+.pgv-focus {
+  outline: none;
+}
+.pgv-focus:focus,
+.pgv-focus:focus-visible {
+  box-shadow: 0 0 0 2px var(--focus-ring);
+  border-color: var(--accent);
+}

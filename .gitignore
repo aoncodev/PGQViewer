@@ -1,0 +1,76 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Node / pnpm
+node_modules/
+.pnpm-store/
+.pnpm-debug.log*
+npm-debug.log*
+yarn-error.log
+.parcel-cache/
+
+# Vite / bundlers
+dist/
+.cache/
+.turbo/
+
+# Embedded web UI bundle: build artifact (copied from apps/renderer/dist by
+# `pnpm copy:webui`), but the .gitkeep must stay tracked so `go:embed
+# all:dist` always has a directory to embed. Git can't re-include a file
+# inside an ignored directory, so first re-include the dir itself.
+!/server/internal/webui/dist
+/server/internal/webui/dist/*
+!/server/internal/webui/dist/.gitkeep
+
+# TypeScript incremental build cache
+*.tsbuildinfo
+
+# Electron
+out/
+release/
+*.dmg
+*.exe
+*.AppImage
+
+# Go
+/server/pgqviewer-server
+/server/bin/
+*.test
+*.out
+coverage.txt
+vendor/
+
+# App data (local dev)
+*.db
+*.db-journal
+*.sqlite
+*.sqlite-journal
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Build artifacts
+/build/
+/coverage/
+
+# Misc
+*.log
+.tmp/
+
+# Local dev infrastructure — PG19 build container, compose file, and seed
+# SQL live on disk for our testing but aren't part of the viewer product.
+/docker/
+/docker-compose.yml
+/initdb/
+
+# Internal planning / design docs — kept on disk, not published.
+/PLAN.md

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none">
+  <!-- PGQViewer mark: a property graph shaped like the letter Q (SQL/PGQ).
+       Hardcoded to the Blue accent (light-mode --accent ≈ #2563EB). -->
+  <path d="M22 8 L34.4 17 L29.6 31.5 L14.4 31.5 L9.6 17 Z" stroke="#2563EB" stroke-width="2.25" stroke-linejoin="round" stroke-linecap="round" opacity="0.6"/>
+  <path d="M29.6 31.5 L39.5 40.5" stroke="#2563EB" stroke-width="2.25" stroke-linecap="round" opacity="0.6"/>
+  <circle cx="22" cy="8" r="3.5" fill="#2563EB"/>
+  <circle cx="34.4" cy="17" r="3.5" fill="#2563EB"/>
+  <circle cx="29.6" cy="31.5" r="3.5" fill="#2563EB"/>
+  <circle cx="14.4" cy="31.5" r="3.5" fill="#2563EB"/>
+  <circle cx="9.6" cy="17" r="3.5" fill="#2563EB"/>
+  <circle cx="39.5" cy="40.5" r="4" fill="#2563EB"/>
+</svg>

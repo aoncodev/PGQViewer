@@ -1,0 +1,11 @@
+# Keep the build context small; the Dockerfile copies only apps/renderer
+# and server explicitly, but node_modules/.git dominate context upload time.
+.git
+**/node_modules
+**/dist
+server/bin
+server/pgqviewer-server
+server/internal/webui/dist/*
+docker
+*.md
+*.log

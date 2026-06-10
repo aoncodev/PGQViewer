@@ -1,0 +1,23 @@
+{
+  "name": "pgqviewer",
+  "private": true,
+  "version": "0.0.0",
+  "license": "Apache-2.0",
+  "scripts": {
+    "build:renderer": "pnpm --filter @pgqviewer/renderer build",
+    "copy:webui": "rm -rf server/internal/webui/dist && mkdir -p server/internal/webui/dist && cp -r apps/renderer/dist/. server/internal/webui/dist/ && touch server/internal/webui/dist/.gitkeep",
+    "build:server": "cd server && go build -o bin/pgqviewer-server ./cmd/pgqviewer-server",
+    "build": "pnpm build:renderer && pnpm copy:webui && pnpm build:server",
+    "dev:server": "cd server && ./bin/pgqviewer-server --http 127.0.0.1:8080",
+    "dev:renderer": "pnpm --filter @pgqviewer/renderer dev",
+    "dev": "pnpm build:server && concurrently --names 'server,vite' --prefix-colors 'cyan,magenta' --kill-others-on-fail 'pnpm dev:server' 'pnpm dev:renderer'",
+    "test:server": "cd server && PGVIEWER_TEST_DSN=${PGVIEWER_TEST_DSN:-postgres://postgres:postgres@127.0.0.1:5435/pgviewer?sslmode=disable} go test ./..."
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": []
+  },
+  "packageManager": "pnpm@11.0.9"
+}
