@@ -4,7 +4,7 @@ A community graph viewer for **PostgreSQL 19**'s native property graphs (SQL/PGQ
 
 Connect to your PostgreSQL 19 database, pick a property graph from the sidebar, type a `MATCH` pattern, and explore the result on an interactive canvas — no extensions, no separate graph database, no ETL.
 
-![PGQViewer rendering the acted_in edges of a films property graph](docs/screenshot.png)
+![PGQViewer rendering the acted_in edges of a films property graph](docs/img.png)
 
 PGQViewer focuses on doing one thing well: **viewing**. There's no graph designer, notebook, privileges UI, or schema diff — read the graph, draw the graph, export the graph.
 
