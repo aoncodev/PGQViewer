@@ -3,6 +3,7 @@ package sqlpgq_test
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,8 +16,9 @@ import (
 // so `go test ./...` stays green on a fresh checkout.
 //
 // To enable:
-//   export PGVIEWER_TEST_DSN='postgres://postgres:postgres@127.0.0.1:5435/pgviewer?sslmode=disable'
-//   go test ./internal/sqlpgq -v
+//
+//	export PGVIEWER_TEST_DSN='postgres://postgres:postgres@127.0.0.1:5435/pgviewer?sslmode=disable'
+//	go test ./internal/sqlpgq -v
 func dsnOrSkip(t *testing.T) string {
 	t.Helper()
 	dsn := os.Getenv("PGVIEWER_TEST_DSN")
@@ -184,6 +186,103 @@ func TestGetCounts_SocialGraph(t *testing.T) {
 		}
 		if len(c.Labels) == 0 {
 			t.Errorf("expected at least one label for %s", c.Alias)
+		}
+	}
+}
+
+// selfRefGraph builds an in-memory self-referential metadata (people -knows->
+// people) for unit-testing BuildRecursiveExpansion without a database.
+func selfRefGraph() (*sqlpgq.GraphMetadata, *sqlpgq.Element) {
+	md := &sqlpgq.GraphMetadata{
+		Graph: sqlpgq.Graph{Schema: "public", Name: "social"},
+		Vertices: []sqlpgq.Element{{
+			OID:        100,
+			Alias:      "people",
+			Kind:       "v",
+			Table:      sqlpgq.TableRef{Schema: "public", Name: "people"},
+			PK:         []string{"id"},
+			Labels:     []string{"person"},
+			Properties: []sqlpgq.Property{{Name: "id", Type: "integer"}, {Name: "name", Type: "text"}},
+		}},
+		Edges: []sqlpgq.Element{{
+			OID:         200,
+			Alias:       "knows",
+			Kind:        "e",
+			Table:       sqlpgq.TableRef{Schema: "public", Name: "knows"},
+			PK:          []string{"src", "dst"},
+			Labels:      []string{"knows"},
+			Properties:  []sqlpgq.Property{{Name: "src", Type: "integer"}, {Name: "dst", Type: "integer"}},
+			Source:      &sqlpgq.EdgeEnd{VertexOID: 100, Vertex: "people", Key: []string{"src"}, Ref: []string{"id"}},
+			Destination: &sqlpgq.EdgeEnd{VertexOID: 100, Vertex: "people", Key: []string{"dst"}, Ref: []string{"id"}},
+		}},
+	}
+	return md, &md.Vertices[0]
+}
+
+func TestBuildRecursiveExpansion_OneHopIsPlainJoinWithParams(t *testing.T) {
+	md, anchor := selfRefGraph()
+	qs, err := sqlpgq.BuildRecursiveExpansion(md, anchor, []string{"3"}, nil, 0, 1)
+	if err != nil {
+		t.Fatalf("BuildRecursiveExpansion: %v", err)
+	}
+	// Self-edge emits both directions.
+	if len(qs) != 2 {
+		t.Fatalf("want 2 queries (outgoing + incoming), got %d", len(qs))
+	}
+	for _, q := range qs {
+		if strings.Contains(q.Query.SQL, "RECURSIVE") {
+			t.Errorf("1-hop query should not be recursive:\n%s", q.Query.SQL)
+		}
+		if len(q.Params) != 1 || q.Params[0] != "3" {
+			t.Errorf("want params [3], got %v", q.Params)
+		}
+		if !strings.Contains(q.Query.SQL, "$1") {
+			t.Errorf("query should bind $1, not inline a literal:\n%s", q.Query.SQL)
+		}
+		if strings.Contains(q.Query.SQL, "'3'") {
+			t.Errorf("query should not inline the PK literal:\n%s", q.Query.SQL)
+		}
+		// Decoder column-naming must match the projection scheme.
+		for _, want := range []string{`"a__pk__id"`, `"b__pk__id"`, `"k__pk__src"`, `"k__sk__src"`, `"k__dk__dst"`} {
+			if !strings.Contains(q.Query.SQL, want) {
+				t.Errorf("SQL missing %s:\n%s", want, q.Query.SQL)
+			}
+		}
+	}
+}
+
+func TestBuildRecursiveExpansion_MultiHopUsesRecursiveCTE(t *testing.T) {
+	md, anchor := selfRefGraph()
+	qs, err := sqlpgq.BuildRecursiveExpansion(md, anchor, []string{"3"}, nil, 0, 3)
+	if err != nil {
+		t.Fatalf("BuildRecursiveExpansion: %v", err)
+	}
+	if len(qs) != 2 {
+		t.Fatalf("want 2 queries, got %d", len(qs))
+	}
+	for _, q := range qs {
+		if !strings.Contains(q.Query.SQL, "WITH RECURSIVE frontier") {
+			t.Errorf("multi-hop query should use WITH RECURSIVE:\n%s", q.Query.SQL)
+		}
+		if !strings.Contains(q.Query.SQL, "fr.depth < 3") {
+			t.Errorf("multi-hop query should bound depth at 3:\n%s", q.Query.SQL)
+		}
+		if len(q.Params) != 1 || q.Params[0] != "3" {
+			t.Errorf("want params [3], got %v", q.Params)
+		}
+	}
+}
+
+func TestBuildRecursiveExpansion_DefaultDepthMatchesOneHop(t *testing.T) {
+	md, anchor := selfRefGraph()
+	// maxDepth <= 0 should behave as 1 (no recursion), matching legacy 1-hop.
+	qs, err := sqlpgq.BuildRecursiveExpansion(md, anchor, []string{"3"}, nil, 0, 0)
+	if err != nil {
+		t.Fatalf("BuildRecursiveExpansion: %v", err)
+	}
+	for _, q := range qs {
+		if strings.Contains(q.Query.SQL, "RECURSIVE") {
+			t.Errorf("default depth should not be recursive:\n%s", q.Query.SQL)
 		}
 	}
 }

@@ -6,7 +6,293 @@ import (
 	"testing"
 
 	"github.com/aoncodev/PGQViewer/server/internal/sqlpgq"
+	"github.com/jackc/pgx/v5/pgtype"
 )
+
+// numericFromString builds a pgtype.Numeric from a decimal string, mirroring
+// the way pgx hands back a NUMERIC column value.
+func numericFromString(t *testing.T, s string) pgtype.Numeric {
+	t.Helper()
+	var n pgtype.Numeric
+	if err := n.Scan(s); err != nil {
+		t.Fatalf("scan numeric %q: %v", s, err)
+	}
+	return n
+}
+
+// TestFormatPKPart_IDCollapse pins the contract that the vertex-PK path and
+// the edge src/dst-key path produce identical synthetic ids for the same
+// logical value regardless of which pgx Go-type the value arrives as. Both
+// paths funnel through formatPKPart (exercised here via the decoder), so a
+// numeric 42 arriving as int64 on one side and pgtype.Numeric on the other
+// must collapse to the same id — otherwise an edge endpoint would never line
+// up with its vertex on the canvas.
+func TestFormatPKPart_IDCollapse(t *testing.T) {
+	idExpr := "id"
+	srcExpr := "src"
+	dstExpr := "dst"
+	md := &sqlpgq.GraphMetadata{
+		Graph: sqlpgq.Graph{Schema: "public", Name: "g"},
+		Vertices: []sqlpgq.Element{{
+			OID:    100,
+			Alias:  "people",
+			Kind:   "v",
+			PK:     []string{"id"},
+			Labels: []string{"person"},
+			Properties: []sqlpgq.Property{
+				{Name: "person_id", Type: "integer", Expression: &idExpr},
+			},
+		}},
+		Edges: []sqlpgq.Element{{
+			OID:    200,
+			Alias:  "knows",
+			Kind:   "e",
+			PK:     []string{"src", "dst"},
+			Labels: []string{"knows"},
+			Properties: []sqlpgq.Property{
+				{Name: "from_id", Type: "integer", Expression: &srcExpr},
+				{Name: "to_id", Type: "integer", Expression: &dstExpr},
+			},
+			Source:      &sqlpgq.EdgeEnd{VertexOID: 100, Key: []string{"src"}, Ref: []string{"id"}},
+			Destination: &sqlpgq.EdgeEnd{VertexOID: 100, Key: []string{"dst"}, Ref: []string{"id"}},
+		}},
+	}
+
+	// Build a projection over the vertex to get the vertex id string, and one
+	// over the edge to get the source endpoint id string, for the same logical
+	// value 42 — but supply different Go representations on each side.
+	vpq, err := sqlpgq.BuildProjection(md,
+		[]sqlpgq.Binding{{Alias: "a", ElementOID: 100}}, "(a IS person)", "", 0)
+	if err != nil {
+		t.Fatalf("vertex BuildProjection: %v", err)
+	}
+	epq, err := sqlpgq.BuildProjection(md,
+		[]sqlpgq.Binding{{Alias: "k", ElementOID: 200}}, "()-[k IS knows]->()", "", 0)
+	if err != nil {
+		t.Fatalf("edge BuildProjection: %v", err)
+	}
+
+	cases := []struct {
+		name      string
+		vertexVal any // value for the vertex PK column (person_id)
+		srcVal    any // value for the edge source key column (from_id)
+	}{
+		{"int64 vs pgtype.Numeric", int64(42), numericFromString(t, "42")},
+		{"int32 vs int64", int32(42), int64(42)},
+		{"pgtype.Int4 vs int", pgtype.Int4{Int32: 42, Valid: true}, int(42)},
+		{"int vs pgtype.Numeric", int(7), numericFromString(t, "7")},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Vertex row: [pk(person_id), prop(person_id)] — one PK col, one prop.
+			vEvents := vpq.Decoder.Decode([]any{tc.vertexVal, tc.vertexVal})
+			if len(vEvents) != 1 {
+				t.Fatalf("vertex events = %d, want 1", len(vEvents))
+			}
+			vertexID := vEvents[0].ID
+
+			// Edge row layout (sorted alias "k"): pk(src), pk(dst), prop(from_id),
+			// prop(to_id), sk(src), dk(dst). Set src side to srcVal, dst to a
+			// distinct value so the source id derives from srcVal.
+			eEvents := epq.Decoder.Decode([]any{
+				tc.srcVal, int64(999), // pk src, pk dst
+				tc.srcVal, int64(999), // prop from_id, to_id
+				tc.srcVal, int64(999), // sk src, dk dst
+			})
+			if len(eEvents) != 1 {
+				t.Fatalf("edge events = %d, want 1", len(eEvents))
+			}
+			if eEvents[0].Source != vertexID {
+				t.Fatalf("edge source id %q != vertex id %q", eEvents[0].Source, vertexID)
+			}
+		})
+	}
+}
+
+// TestFormatPKPart_BoolFloatText covers the canonical-form contract for the
+// newly broadened scalar types: a value arriving as a raw Go type and the
+// same value arriving as its pgtype wrapper must produce the same id.
+func TestFormatPKPart_BoolFloatText(t *testing.T) {
+	keyExpr := "k"
+	mkMD := func() *sqlpgq.GraphMetadata {
+		return &sqlpgq.GraphMetadata{
+			Graph: sqlpgq.Graph{Schema: "public", Name: "g"},
+			Vertices: []sqlpgq.Element{{
+				OID:    100,
+				Alias:  "v",
+				Kind:   "v",
+				PK:     []string{"k"},
+				Labels: []string{"l"},
+				Properties: []sqlpgq.Property{
+					{Name: "key", Type: "text", Expression: &keyExpr},
+				},
+			}},
+		}
+	}
+	pq, err := sqlpgq.BuildProjection(mkMD(),
+		[]sqlpgq.Binding{{Alias: "v", ElementOID: 100}}, "(v IS l)", "", 0)
+	if err != nil {
+		t.Fatalf("BuildProjection: %v", err)
+	}
+
+	id := func(pkVal any) string {
+		evs := pq.Decoder.Decode([]any{pkVal, pkVal})
+		if len(evs) != 1 {
+			t.Fatalf("events = %d, want 1", len(evs))
+		}
+		return evs[0].ID
+	}
+
+	pairs := []struct {
+		name string
+		a, b any
+	}{
+		{"bool", true, pgtype.Bool{Bool: true, Valid: true}},
+		{"float8", float64(1.5), pgtype.Float8{Float64: 1.5, Valid: true}},
+		{"text", "hello", pgtype.Text{String: "hello", Valid: true}},
+		{"int4-raw-vs-wrapped", int32(3), pgtype.Int4{Int32: 3, Valid: true}},
+	}
+	for _, p := range pairs {
+		t.Run(p.name, func(t *testing.T) {
+			if got, want := id(p.a), id(p.b); got != want {
+				t.Fatalf("ids differ: %q vs %q", got, want)
+			}
+		})
+	}
+}
+
+// TestBuildProjection_CustomColumns checks that a caller-supplied COLUMNS list
+// is emitted verbatim, the query is flagged tabular with a nil decoder, and
+// params are carried through.
+func TestBuildProjection_CustomColumns(t *testing.T) {
+	md := &sqlpgq.GraphMetadata{
+		Graph: sqlpgq.Graph{Schema: "public", Name: "g"},
+		Vertices: []sqlpgq.Element{{
+			OID: 100, Alias: "people", Kind: "v", PK: []string{"id"},
+			Labels:     []string{"person"},
+			Properties: []sqlpgq.Property{{Name: "name", Type: "text"}},
+		}},
+	}
+	pq, err := sqlpgq.BuildProjectionWithOpts(sqlpgq.ProjectionOpts{
+		Metadata: md,
+		Bindings: []sqlpgq.Binding{{Alias: "a", ElementOID: 100}},
+		Match:    "(a IS person)",
+		Columns:  []string{"a.name AS who", "count(*) OVER () AS n"},
+		Params:   []any{int64(5)},
+	})
+	if err != nil {
+		t.Fatalf("BuildProjectionWithOpts: %v", err)
+	}
+	if !pq.Tabular {
+		t.Fatalf("expected Tabular=true")
+	}
+	if pq.Decoder != nil {
+		t.Fatalf("expected nil Decoder for tabular query")
+	}
+	if !strings.Contains(pq.SQL, "a.name AS who") || !strings.Contains(pq.SQL, "count(*) OVER () AS n") {
+		t.Fatalf("custom columns not emitted verbatim:\n%s", pq.SQL)
+	}
+	if len(pq.Params) != 1 {
+		t.Fatalf("params not carried: %v", pq.Params)
+	}
+}
+
+// TestBuildProjection_WideElementTrim checks that an element with more than the
+// threshold count of properties and no explicit DisplayProperties is trimmed
+// to a heuristic display set, with PK still projected and a TrimInfo recorded.
+func TestBuildProjection_WideElementTrim(t *testing.T) {
+	props := []sqlpgq.Property{{Name: "id", Type: "integer"}}
+	for i := 0; i < 40; i++ {
+		props = append(props, sqlpgq.Property{Name: padName("col", i), Type: "integer"})
+	}
+	// Inject a name-ish column the heuristic should prefer.
+	props = append(props, sqlpgq.Property{Name: "name", Type: "text"})
+
+	md := &sqlpgq.GraphMetadata{
+		Graph: sqlpgq.Graph{Schema: "public", Name: "g"},
+		Vertices: []sqlpgq.Element{{
+			OID: 100, Alias: "wide", Kind: "v", PK: []string{"id"},
+			Labels: []string{"w"}, Properties: props,
+		}},
+	}
+	pq, err := sqlpgq.BuildProjection(md,
+		[]sqlpgq.Binding{{Alias: "a", ElementOID: 100}}, "(a IS w)", "", 0)
+	if err != nil {
+		t.Fatalf("BuildProjection: %v", err)
+	}
+	if len(pq.Trimmed) != 1 {
+		t.Fatalf("expected 1 TrimInfo, got %d", len(pq.Trimmed))
+	}
+	if pq.Trimmed[0].Total != len(props) {
+		t.Fatalf("TrimInfo.Total = %d, want %d", pq.Trimmed[0].Total, len(props))
+	}
+	// PK still projected.
+	if !strings.Contains(pq.SQL, `"a__pk__id"`) {
+		t.Fatalf("PK not projected after trim:\n%s", pq.SQL)
+	}
+	// Heuristic picked the name-ish column.
+	if !strings.Contains(pq.SQL, `"a__p__name"`) {
+		t.Fatalf("expected name column in trimmed projection:\n%s", pq.SQL)
+	}
+	// A non-displayed numeric column must be absent from the property block.
+	if strings.Contains(pq.SQL, `"a__p__col0"`) {
+		t.Fatalf("trim did not drop wide columns:\n%s", pq.SQL)
+	}
+}
+
+// TestBuildProjection_ColumnMap verifies the synthetic-alias -> (binding,
+// property) mapping is populated for the auto-projection.
+func TestBuildProjection_ColumnMap(t *testing.T) {
+	md := &sqlpgq.GraphMetadata{
+		Graph: sqlpgq.Graph{Schema: "public", Name: "g"},
+		Vertices: []sqlpgq.Element{{
+			OID: 100, Alias: "people", Kind: "v", PK: []string{"id"},
+			Labels: []string{"person"},
+			Properties: []sqlpgq.Property{
+				{Name: "id", Type: "integer"},
+				{Name: "name", Type: "text"},
+			},
+		}},
+	}
+	pq, err := sqlpgq.BuildProjection(md,
+		[]sqlpgq.Binding{{Alias: "a", ElementOID: 100}}, "(a IS person)", "", 0)
+	if err != nil {
+		t.Fatalf("BuildProjection: %v", err)
+	}
+	want := map[string]sqlpgq.ColumnMapping{
+		"a__pk__id": {Column: "a__pk__id", Alias: "a", Property: "id", Role: "pk"},
+		"a__p__name": {Column: "a__p__name", Alias: "a", Property: "name", Role: "p"},
+	}
+	got := map[string]sqlpgq.ColumnMapping{}
+	for _, m := range pq.ColumnMap {
+		got[m.Column] = m
+	}
+	for col, exp := range want {
+		if got[col] != exp {
+			t.Fatalf("ColumnMap[%q] = %+v, want %+v", col, got[col], exp)
+		}
+	}
+}
+
+// padName produces a deterministic property name like "col0", "col1".
+func padName(prefix string, i int) string {
+	return prefix + itoa(i)
+}
+
+func itoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	var b [20]byte
+	pos := len(b)
+	for i > 0 {
+		pos--
+		b[pos] = byte('0' + i%10)
+		i /= 10
+	}
+	return string(b[pos:])
+}
 
 func TestBuildProjection_SocialGraph(t *testing.T) {
 	ctx, p := openPool(t)

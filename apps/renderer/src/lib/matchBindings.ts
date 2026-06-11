@@ -21,7 +21,15 @@
 //   • Label disjunctions (`(x IS a|b)`) are explicitly rejected with a
 //     "use SQL mode" hint rather than silently binding to the first
 //     match. PG19 accepts the syntax; we just don't support it in
-//     auto-projection yet.
+//     auto-projection yet (the server can't project one alias to
+//     multiple elements). The rejection string is deliberately kept in
+//     sync with a pattern in lib/errors.ts (needles "label disjunctions"
+//     + "not yet supported in graph mode") so the UI can surface a
+//     one-click remediation action (wrap as GRAPH_TABLE / switch to SQL)
+//     instead of just printing the raw message.
+//     FOLLOWUP: true multi-element projection — letting one alias bind to
+//     every element matched by `IS a|b` and unioning their COLUMNS —
+//     needs server support in projection.go before it can be enabled here.
 //
 //   • Abbreviated edges (`()->()`, `()-()`) don't bind an edge alias —
 //     there's no `[...]` to parse — so no edge binding is produced.
@@ -289,6 +297,9 @@ function parseChunkBody(body: string): ParsedChunk {
       const label = labelMatch[0];
       const afterLabel = skipWS(body, i + labelMatch[0].length);
       if (body[afterLabel] === '|') {
+        // Keep this wording in sync with the matching pattern in
+        // lib/errors.ts (needles "label disjunctions" + "not yet supported
+        // in graph mode"); matchHint() turns it into an actionable hint.
         return {
           alias,
           error:

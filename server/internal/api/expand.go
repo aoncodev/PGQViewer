@@ -34,9 +34,18 @@ type expandRequest struct {
 	AnchorPK         []string `json:"anchor_pk"`
 	EdgeLabels       []string `json:"edge_labels,omitempty"`
 	Limit            int      `json:"limit,omitempty"`
+	// MaxDepth bounds variable-length expansion. 1 (the default when omitted
+	// or <= 0) reproduces the historical 1-hop neighbourhood exactly. Values
+	// > 1 traverse up to that many hops of each candidate edge element via a
+	// WITH RECURSIVE walk (see sqlpgq.BuildRecursiveExpansion). Multi-hop is
+	// only meaningful for self-referential edges; for other edges the depth is
+	// silently capped at 1.
+	MaxDepth int `json:"max_depth,omitempty"`
 }
 
-// expand streams the 1-hop neighbourhood of a vertex as NDJSON.
+// expand streams the neighbourhood of a vertex as NDJSON. By default this is
+// the 1-hop neighbourhood; with max_depth > 1 it streams up to that many hops
+// of each candidate edge via a parameterized WITH RECURSIVE walk.
 //
 // Event types are identical to the /query handler so the renderer can reuse
 // the same dispatch path:
@@ -116,7 +125,11 @@ func (s *Server) Expand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	queries, err := sqlpgq.BuildExpansion(md, anchor, req.AnchorPK, req.EdgeLabels, req.Limit)
+	maxDepth := req.MaxDepth
+	if maxDepth < 1 {
+		maxDepth = 1
+	}
+	queries, err := sqlpgq.BuildRecursiveExpansion(md, anchor, req.AnchorPK, req.EdgeLabels, req.Limit, maxDepth)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -135,14 +148,14 @@ func (s *Server) Expand(w http.ResponseWriter, r *http.Request) {
 	// (different neighbour element). The client can ignore this if it just
 	// wants to merge vertex / edge events into the canvas.
 	type metaSub struct {
-		SQL      string                  `json:"sql"`
-		Bindings []sqlpgq.BindingView    `json:"bindings"`
+		SQL      string               `json:"sql"`
+		Bindings []sqlpgq.BindingView `json:"bindings"`
 	}
 	subs := make([]metaSub, 0, len(queries))
 	for _, q := range queries {
 		subs = append(subs, metaSub{
-			SQL:      q.SQL,
-			Bindings: q.Decoder.BindingViews(),
+			SQL:      q.Query.SQL,
+			Bindings: q.Query.Decoder.BindingViews(),
 		})
 	}
 	_ = enc.Encode(map[string]any{
@@ -160,7 +173,7 @@ func (s *Server) Expand(w http.ResponseWriter, r *http.Request) {
 		subRows := 0
 		subVertices := 0
 		subEdges := 0
-		if err := streamExpandOne(r.Context(), sess.Pool, q, enc, flusher, &subRows, &subVertices, &subEdges); err != nil {
+		if err := streamExpandOne(r.Context(), sess.Pool, q.Query, q.Params, enc, flusher, &subRows, &subVertices, &subEdges); err != nil {
 			streamErr = fmt.Errorf("subquery %d: %w", i, err)
 			break
 		}
@@ -199,11 +212,12 @@ func streamExpandOne(
 	ctx context.Context,
 	pool poolQuerier,
 	pq *sqlpgq.ProjectedQuery,
+	params []any,
 	enc *json.Encoder,
 	flusher http.Flusher,
 	rowsOut, vertOut, edgeOut *int,
 ) error {
-	rows, err := pool.Query(ctx, pq.SQL)
+	rows, err := pool.Query(ctx, pq.SQL, params...)
 	if err != nil {
 		return fmt.Errorf("query: %w", err)
 	}

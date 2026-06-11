@@ -3,15 +3,27 @@ import {
   cancelQuery,
   streamExpand,
   streamQuery,
+  type MetaEvent,
   type QueryEvent,
 } from '../lib/api';
 import { formatElementId } from '../lib/elementId';
-import { matchHint } from '../lib/errors';
-import { inferBindings } from '../lib/matchBindings';
+import { matchHint, type ErrorHintAction } from '../lib/errors';
+import { parseGraphTableSql } from '../lib/graphTableSql';
+import { buildTemplates, type MatchTemplate } from '../lib/graphTemplates';
+import { inferBindings, type InferResult } from '../lib/matchBindings';
+import {
+  addSavedQuery,
+  loadSavedQueries,
+  removeSavedQuery,
+  type SavedQuery,
+} from '../lib/savedQueries';
 import { readFlag, readJSON, readNumber } from '../lib/storage';
 import { useApp, type EdgeLink, type VertexNode } from '../lib/store';
 import { useDragResize } from '../lib/useDragResize';
+import { BindingPreview } from './BindingPreview';
 import { EdgeWeightModal } from './EdgeWeightModal';
+import { ExplainPanel } from './ExplainPanel';
+import { GeneratedSqlPanel } from './GeneratedSqlPanel';
 import { GraphCanvas } from './GraphCanvas';
 import { GraphFilterModal } from './GraphFilterModal';
 import { HintPopover } from './HintPopover';
@@ -20,8 +32,16 @@ import { Splitter } from './Splitter';
 import { SqlEditor } from './SqlEditor';
 import { TableView } from './TableView';
 
+// Layout declutter (2026-06): rarely-used query-panel surfaces are hidden for
+// now to keep the editor area calm. The components and their wiring are kept
+// intact — flip any flag to true to bring the surface back.
+const SHOW_LATERAL_PANE = false;
+const SHOW_BINDING_PREVIEW = false;
+const SHOW_TEMPLATES = false;
+const SHOW_SAVED_QUERIES = false;
+
 type Mode = 'graph' | 'sql';
-type ResultTab = 'graph' | 'table' | 'json';
+type ResultTab = 'graph' | 'table' | 'json' | 'explain';
 
 interface Stats {
   rows: number;
@@ -67,6 +87,31 @@ export function Workspace() {
   const [lastError, setLastError] = useState<string | null>(null);
   const [qid, setQid] = useState<string | null>(null);
   const [paramsText, setParamsText] = useState('');
+  // Graph-mode dedicated WHERE predicate. matchText stays the pure pattern;
+  // this rides along as request.where so the server appends a top-level
+  // WHERE to the generated GRAPH_TABLE.
+  const [whereText, setWhereText] = useState('');
+  // Lateral FROM disclosure. fromText is a newline-separated list of FROM
+  // items; lateralAlias names the GRAPH_TABLE reference for correlation.
+  const [fromText, setFromText] = useState('');
+  const [lateralAlias, setLateralAlias] = useState('');
+  // EXPLAIN toggle: 'off' runs normally, 'explain' asks for the plan,
+  // 'analyze' runs EXPLAIN ANALYZE (actually executes).
+  const [explainMode, setExplainMode] = useState<'off' | 'explain' | 'analyze'>(
+    'off',
+  );
+  // Generated GRAPH_TABLE SQL + per-binding summary, captured from the meta
+  // event of the most recent graph-mode run.
+  const [genSql, setGenSql] = useState<string | null>(null);
+  const [genBindings, setGenBindings] = useState<MetaEvent['bindings']>(undefined);
+  // Query plan from the most recent EXPLAIN run. Null = no plan to show.
+  const [explainPlan, setExplainPlan] = useState<unknown | null>(null);
+  // Live binding preview for the current MATCH pattern (debounced).
+  const [bindingPreview, setBindingPreview] = useState<InferResult | null>(null);
+  // Named saved queries (localStorage).
+  const [savedQueries, setSavedQueries] = useState<SavedQuery[]>(() =>
+    loadSavedQueries(),
+  );
   // Graph-mode LIMIT. Default 500 — small enough that the canvas first-paint
   // is meaningful even on million-element graphs, large enough that
   // 1k-edge demo graphs land in one shot. Last-used value persists per
@@ -97,6 +142,11 @@ export function Workspace() {
     }
   }
   const abortRef = useRef<AbortController | null>(null);
+  // Per-run flag for auto-collapse: set true when a run starts, cleared by any
+  // error (thrown or in-band 'error' event) or abort, so a FAILED run keeps the
+  // editor expanded (the error hint lives there). Session-only — auto-collapse
+  // deliberately does not persist, so a page reload always starts expanded.
+  const collapseAfterRunRef = useRef(false);
   // Pending events accumulate here between microtask flushes. Coalescing
   // many NDJSON lines into one store mutation cuts the streaming path from
   // O(N²) (one Map copy per event) to O(N) (one Map copy per batch).
@@ -254,6 +304,28 @@ export function Workspace() {
     return out;
   }, [metadata]);
 
+  // MATCH templates derived from the selected graph's labels.
+  const templates = useMemo(() => buildTemplates(metadata), [metadata]);
+
+  // Live binding preview: debounce inferBindings on the MATCH pattern so we
+  // can show alias→label chips and "won't be drawn" warnings BEFORE running.
+  // Graph mode only; cleared otherwise so a stale preview doesn't linger.
+  useEffect(() => {
+    if (mode !== 'graph' || !metadata) {
+      setBindingPreview(null);
+      return;
+    }
+    const text = matchText.trim();
+    if (!text) {
+      setBindingPreview(null);
+      return;
+    }
+    const handle = window.setTimeout(() => {
+      setBindingPreview(inferBindings(matchText, metadata));
+    }, 250);
+    return () => window.clearTimeout(handle);
+  }, [matchText, metadata, mode]);
+
   // Append snippets dispatched from elsewhere (e.g. sidebar element clicks).
   // The store carries the target mode; if the user is in a different mode we
   // hop to it so the insert lands somewhere visible.
@@ -287,6 +359,12 @@ export function Workspace() {
     setStats(null);
     setLastError(null);
     setQid(null);
+    // Assume success; any error path below clears this so we don't collapse.
+    collapseAfterRunRef.current = true;
+    // Clear any prior captured SQL / plan so the panels reflect THIS run.
+    setGenSql(null);
+    setGenBindings(undefined);
+    setExplainPlan(null);
     setBusy(true);
     // Drop any leftover-but-not-yet-flushed events from the previous run.
     // Without this, a microtask scheduled by the prior stream could fire
@@ -310,14 +388,22 @@ export function Workspace() {
         // why a node might look disconnected instead of leaving them to
         // distrust the renderer.
         bindings.warnings?.forEach((w) => pushToast('info', w));
+        const fromItems = parseLines(fromText);
+        const params = parseParams(paramsText);
         await streamQuery(
           sid,
           {
             mode: 'graph',
             graph_oid: metadata.graph.oid,
             match: matchText,
+            where: whereText.trim() || undefined,
             bindings: bindings.bindings,
             limit: runLimit,
+            from: fromItems.length > 0 ? fromItems : undefined,
+            lateral_alias: lateralAlias.trim() || undefined,
+            params: params ?? undefined,
+            explain: explainMode === 'explain' || undefined,
+            explain_analyze: explainMode === 'analyze' || undefined,
           },
           handleEvent,
           controller.signal,
@@ -334,6 +420,8 @@ export function Workspace() {
         );
       }
     } catch (e) {
+      // A failed/aborted run must keep the editor open (the hint lives there).
+      collapseAfterRunRef.current = false;
       // AbortError = user clicked Cancel; don't surface that as an error.
       if (e instanceof DOMException && e.name === 'AbortError') {
         pushToast('info', 'Query cancelled');
@@ -349,7 +437,170 @@ export function Workspace() {
       setBusy(false);
       setQid(null);
       abortRef.current = null;
+      // Auto-collapse the editor after a clean run so the result/canvas gets
+      // the space. Cleared on error/abort above so the hint stays visible.
+      // Non-persisting setter: collapse is session-only (reload starts open).
+      if (collapseAfterRunRef.current) setEditorCollapsedState(true);
     }
+  }
+
+  // Hand the supplied SQL to SQL mode (used by the Generated SQL panel's
+  // "Open in SQL mode" button). Shared with the hint-action wiring below.
+  function openInSqlMode(sql: string) {
+    resetHistoryCursor('sql');
+    setMode('sql');
+    setSqlText(sql);
+  }
+
+  // Wraps the current MATCH pattern in a runnable GRAPH_TABLE skeleton so the
+  // user can finish it by hand in SQL mode. Used by the 'wrap-graph-table'
+  // hint action and as a fallback when there's no captured SQL.
+  function wrapMatchAsGraphTable(): string {
+    const graphName = metadata
+      ? metadata.graph.schema && metadata.graph.schema !== 'public'
+        ? `${metadata.graph.schema}.${metadata.graph.name}`
+        : metadata.graph.name
+      : 'your_graph';
+    const pattern = matchText.trim() || '(a)-[e]->(b)';
+    const whereClause = whereText.trim() ? `\n    WHERE ${whereText.trim()}` : '';
+    return `SELECT *\nFROM GRAPH_TABLE (\n  ${graphName}\n  MATCH ${pattern}${whereClause}\n  COLUMNS (a.*)\n);`;
+  }
+
+  // Implements the ErrorHintAction kinds surfaced by HintPopover. 'switch-to-
+  // sql' just hops modes (carrying any payload SQL); 'wrap-graph-table' seeds
+  // SQL mode with a GRAPH_TABLE wrapper around the current pattern.
+  function onHintAction(action: ErrorHintAction) {
+    if (action.kind === 'switch-to-sql') {
+      if (action.payload) openInSqlMode(action.payload);
+      else {
+        resetHistoryCursor('sql');
+        setMode('sql');
+      }
+    } else if (action.kind === 'wrap-graph-table') {
+      openInSqlMode(action.payload ?? wrapMatchAsGraphTable());
+    }
+  }
+
+  // "View as graph" for a GRAPH_TABLE SQL statement typed in SQL mode. Parses
+  // the SQL, checks the graph name matches the selected graph, infers bindings
+  // from the MATCH, and runs the auto-projecting graph endpoint so the canvas
+  // renders. The user's COLUMNS is intentionally ignored (server projects
+  // identity columns itself).
+  async function viewAsGraph() {
+    if (!sid || busy) return;
+    if (!metadata) {
+      pushToast('error', 'Select a graph first to view SQL as a graph.');
+      return;
+    }
+    const parsed = parseGraphTableSql(sqlText);
+    if (!parsed) {
+      pushToast(
+        'error',
+        'No GRAPH_TABLE(...) found in this SQL. View as graph only works on a top-level GRAPH_TABLE query.',
+      );
+      return;
+    }
+    // Compare against the selected graph, tolerating an unqualified name or a
+    // schema-qualified one.
+    const selected = metadata.graph.name.toLowerCase();
+    const selectedQualified = `${metadata.graph.schema}.${metadata.graph.name}`.toLowerCase();
+    const parsedName = parsed.graphName.replace(/"/g, '').toLowerCase();
+    if (parsedName !== selected && parsedName !== selectedQualified) {
+      pushToast(
+        'error',
+        `This SQL queries graph "${parsed.graphName}", but "${metadata.graph.name}" is selected. Pick that graph in the sidebar, then try again.`,
+      );
+      return;
+    }
+    const bindings = inferBindings(parsed.match, metadata);
+    if (bindings.error) {
+      pushToast('error', bindings.error);
+      return;
+    }
+    bindings.warnings?.forEach((w) => pushToast('info', w));
+
+    setStats(null);
+    setLastError(null);
+    setQid(null);
+    setGenSql(null);
+    setGenBindings(undefined);
+    setExplainPlan(null);
+    setMode('graph');
+    setMatchText(parsed.match);
+    if (parsed.where !== undefined) setWhereText(parsed.where);
+    setTab('graph');
+    setBusy(true);
+    const p = pendingRef.current;
+    p.v = [];
+    p.e = [];
+    p.r = [];
+    clearResult();
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+    try {
+      await streamQuery(
+        sid,
+        {
+          mode: 'graph',
+          graph_oid: metadata.graph.oid,
+          match: parsed.match,
+          where: parsed.where,
+          bindings: bindings.bindings,
+          limit: runLimit,
+        },
+        handleEvent,
+        controller.signal,
+        (q) => setQid(q),
+      );
+    } catch (e) {
+      if (e instanceof DOMException && e.name === 'AbortError') {
+        pushToast('info', 'Query cancelled');
+      } else {
+        const msg = String(e instanceof Error ? e.message : e);
+        pushToast('error', msg);
+        setLastError(msg);
+      }
+    } finally {
+      flushPending();
+      setBusy(false);
+      setQid(null);
+      abortRef.current = null;
+    }
+  }
+
+  // --- saved queries -------------------------------------------------------
+  function saveCurrentQuery() {
+    const text = (mode === 'graph' ? matchText : sqlText).trim();
+    if (!text) {
+      pushToast('info', 'Nothing to save — the editor is empty.');
+      return;
+    }
+    const name = window.prompt('Save query as:')?.trim();
+    if (!name) return;
+    setSavedQueries((prev) =>
+      addSavedQuery(prev, {
+        name,
+        mode,
+        text,
+        where: mode === 'graph' && whereText.trim() ? whereText.trim() : undefined,
+      }),
+    );
+    pushToast('success', `Saved “${name}”.`);
+  }
+
+  function applySavedQuery(q: SavedQuery) {
+    setMode(q.mode);
+    if (q.mode === 'graph') {
+      setMatchText(q.text);
+      setWhereText(q.where ?? '');
+    } else {
+      setSqlText(q.text);
+    }
+  }
+
+  function deleteSavedQuery(id: string) {
+    setSavedQueries((prev) => removeSavedQuery(prev, id));
   }
 
   async function cancel() {
@@ -452,11 +703,23 @@ export function Workspace() {
         break;
       case 'error':
         flushPending();
+        // In-band stream error: don't auto-collapse, the hint must stay visible.
+        collapseAfterRunRef.current = false;
         pushToast('error', ev.error);
         setLastError(ev.error);
         break;
       case 'meta':
         if (ev.qid) setQid(ev.qid);
+        // Graph-mode meta carries the projected GRAPH_TABLE SQL and the
+        // per-binding projection summary; stash both so the Generated SQL
+        // panel can render them.
+        if (ev.sql !== undefined) setGenSql(ev.sql);
+        if (ev.bindings !== undefined) setGenBindings(ev.bindings);
+        break;
+      case 'explain':
+        flushPending();
+        setExplainPlan(ev.plan);
+        setTab('explain');
         break;
     }
   }
@@ -526,6 +789,7 @@ export function Workspace() {
               onHistoryPrev={historyPrev}
               onHistoryNext={historyNext}
               schema={editorSchema}
+              graphMeta={metadata}
               placeholder={placeholder}
               heightPx={editorHeight}
             />
@@ -535,10 +799,54 @@ export function Workspace() {
               onDoubleClick={resetEditorHeight}
               title="Drag to resize the editor · double-click to reset"
             />
+            {mode === 'graph' && (
+              <>
+                <div className="mt-2">
+                  <WherePane value={whereText} onChange={setWhereText} />
+                </div>
+                {SHOW_LATERAL_PANE && (
+                  <div className="mt-2">
+                    <LateralPane
+                      fromText={fromText}
+                      onFromChange={setFromText}
+                      lateralAlias={lateralAlias}
+                      onAliasChange={setLateralAlias}
+                    />
+                  </div>
+                )}
+                {SHOW_BINDING_PREVIEW && (
+                  <BindingPreview result={bindingPreview} metadata={metadata} />
+                )}
+                {SHOW_TEMPLATES && templates.length > 0 && (
+                  <TemplateGallery
+                    templates={templates}
+                    onPick={(p) => setEditorValue(p)}
+                  />
+                )}
+                {genSql && (
+                  <div className="mt-2">
+                    <GeneratedSqlPanel
+                      sql={genSql}
+                      bindings={genBindings}
+                      onOpenInSql={openInSqlMode}
+                    />
+                  </div>
+                )}
+              </>
+            )}
             {mode === 'sql' && (
               <div className="mt-2">
                 <ParamsPane value={paramsText} onChange={setParamsText} />
               </div>
+            )}
+            {SHOW_SAVED_QUERIES && (
+              <SavedQueriesBar
+                queries={savedQueries}
+                mode={mode}
+                onSave={saveCurrentQuery}
+                onApply={applySavedQuery}
+                onDelete={deleteSavedQuery}
+              />
             )}
             {hint && (
               <div className="mt-2">
@@ -546,11 +854,25 @@ export function Workspace() {
                   hint={hint}
                   rawError={lastError ?? undefined}
                   onDismiss={() => setLastError(null)}
+                  onAction={onHintAction}
                 />
               </div>
             )}
-            <div className="mt-1 text-xs text-fg-subtle">
-              <kbd className="rounded bg-surface-2 px-1.5 py-0.5">⌘/Ctrl + Enter</kbd> to run
+            <div className="mt-1 flex items-center justify-between gap-2 text-xs text-fg-subtle">
+              <span>
+                <kbd className="rounded bg-surface-2 px-1.5 py-0.5">⌘/Ctrl + Enter</kbd> to run
+              </span>
+              {mode === 'sql' && (
+                <button
+                  type="button"
+                  onClick={viewAsGraph}
+                  disabled={!sid || busy || !metadata}
+                  title="Run a GRAPH_TABLE query through the graph endpoint and render it on the canvas"
+                  className="rounded-md border border-border bg-surface px-2 py-1 text-xs text-fg-muted transition-colors hover:bg-surface-2 hover:text-fg disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  View as graph
+                </button>
+              )}
             </div>
           </div>
           <div className="flex flex-col items-stretch gap-2">
@@ -569,6 +891,25 @@ export function Workspace() {
                   onChange={(e) => setRunLimit(Number(e.target.value) || RUN_LIMIT_DEFAULT)}
                   className="w-20 rounded border border-border bg-surface px-1.5 py-0.5 text-right font-mono text-xs text-fg outline-none focus:border-accent"
                 />
+              </label>
+            )}
+            {mode === 'graph' && (
+              <label
+                className="flex items-center gap-1.5 text-[11px] text-fg-subtle"
+                title="EXPLAIN shows the planner's chosen plan without running. ANALYZE runs the query and reports actual timings."
+              >
+                <span>explain</span>
+                <select
+                  value={explainMode}
+                  onChange={(e) =>
+                    setExplainMode(e.target.value as 'off' | 'explain' | 'analyze')
+                  }
+                  className="rounded border border-border bg-surface px-1.5 py-0.5 text-xs text-fg outline-none focus:border-accent"
+                >
+                  <option value="off">off</option>
+                  <option value="explain">plan</option>
+                  <option value="analyze">analyze</option>
+                </select>
               </label>
             )}
             {showCancel ? (
@@ -602,6 +943,11 @@ export function Workspace() {
         <TabButton active={tab === 'json'} onClick={() => setTab('json')}>
           JSON
         </TabButton>
+        {explainPlan !== null && (
+          <TabButton active={tab === 'explain'} onClick={() => setTab('explain')}>
+            Plan
+          </TabButton>
+        )}
       </div>
 
       <div className="min-h-0 flex-1">
@@ -613,6 +959,15 @@ export function Workspace() {
         )}
         {tab === 'table' && <TableView />}
         {tab === 'json' && <JsonView />}
+        {tab === 'explain' && explainPlan !== null && (
+          <ExplainPanel
+            plan={explainPlan}
+            onClose={() => {
+              setExplainPlan(null);
+              setTab(mode === 'graph' ? 'graph' : 'table');
+            }}
+          />
+        )}
       </div>
 
       <footer className={`border-t border-border bg-surface px-4 py-2 text-xs text-fg-subtle ${focusMode ? 'hidden' : ''}`}>
@@ -656,6 +1011,167 @@ function ParamsPane({ value, onChange }: { value: string; onChange: (v: string) 
   );
 }
 
+// Dedicated WHERE input for graph mode. The pattern stays in the editor; this
+// rides along as request.where so the server appends a top-level WHERE.
+function WherePane({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  // Open by default once the user has typed something, so a restored draft is
+  // visible without a click.
+  const [expanded, setExpanded] = useState(() => value.trim().length > 0);
+  return (
+    <div className="rounded-md border border-border bg-bg">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="flex w-full items-center justify-between px-3 py-1.5 text-xs text-fg-muted hover:text-fg"
+      >
+        <span>WHERE {value.trim() ? '· set' : '· empty'}</span>
+        <span>{expanded ? '▾' : '▸'}</span>
+      </button>
+      {expanded && (
+        <textarea
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder="Top-level predicate, e.g. a.age > 30 OR b.city = 'NYC'"
+          className="block w-full resize-y border-t border-border bg-bg px-3 py-2 font-mono text-xs text-fg outline-none"
+          rows={2}
+        />
+      )}
+    </div>
+  );
+}
+
+// LATERAL FROM disclosure. fromText holds newline-separated FROM items;
+// lateralAlias names the GRAPH_TABLE reference so outer items can correlate.
+function LateralPane({
+  fromText,
+  onFromChange,
+  lateralAlias,
+  onAliasChange,
+}: {
+  fromText: string;
+  onFromChange: (v: string) => void;
+  lateralAlias: string;
+  onAliasChange: (v: string) => void;
+}) {
+  const active = fromText.trim().length > 0 || lateralAlias.trim().length > 0;
+  const [expanded, setExpanded] = useState(active);
+  return (
+    <div className="rounded-md border border-border bg-bg">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="flex w-full items-center justify-between px-3 py-1.5 text-xs text-fg-muted hover:text-fg"
+      >
+        <span>Lateral FROM {active ? '· set' : '· empty'}</span>
+        <span>{expanded ? '▾' : '▸'}</span>
+      </button>
+      {expanded && (
+        <div className="border-t border-border p-2">
+          <label className="mb-2 flex items-center gap-2 text-[11px] text-fg-subtle">
+            <span className="shrink-0">GRAPH_TABLE alias</span>
+            <input
+              value={lateralAlias}
+              onChange={(e) => onAliasChange(e.target.value)}
+              placeholder="gt"
+              className="w-24 rounded border border-border bg-surface px-1.5 py-0.5 font-mono text-xs text-fg outline-none focus:border-accent"
+            />
+          </label>
+          <textarea
+            value={fromText}
+            onChange={(e) => onFromChange(e.target.value)}
+            placeholder={'One FROM item per line, e.g.\nfilters f'}
+            className="block w-full resize-y rounded border border-border bg-surface px-2 py-1.5 font-mono text-xs text-fg outline-none focus:border-accent"
+            rows={2}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Small gallery of MATCH templates derived from the selected graph's labels.
+function TemplateGallery({
+  templates,
+  onPick,
+}: {
+  templates: MatchTemplate[];
+  onPick: (pattern: string) => void;
+}) {
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-1.5">
+      <span className="text-[10px] uppercase tracking-wider text-fg-subtle">
+        templates
+      </span>
+      {templates.map((tpl) => (
+        <button
+          key={tpl.id}
+          type="button"
+          onClick={() => onPick(tpl.pattern)}
+          title={tpl.pattern}
+          className="rounded-full border border-border bg-surface px-2 py-0.5 text-[11px] text-fg-muted transition-colors hover:bg-surface-2 hover:text-fg"
+        >
+          {tpl.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// Saved/named queries bar. Lists saved queries for the active mode and lets
+// the user save the current one or remove existing ones.
+function SavedQueriesBar({
+  queries,
+  mode,
+  onSave,
+  onApply,
+  onDelete,
+}: {
+  queries: SavedQuery[];
+  mode: Mode;
+  onSave: () => void;
+  onApply: (q: SavedQuery) => void;
+  onDelete: (id: string) => void;
+}) {
+  const forMode = queries.filter((q) => q.mode === mode);
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-1.5">
+      <button
+        type="button"
+        onClick={onSave}
+        className="rounded-md border border-border bg-surface px-2 py-0.5 text-[11px] text-fg-muted transition-colors hover:bg-surface-2 hover:text-fg"
+      >
+        Save query
+      </button>
+      {forMode.length > 0 && (
+        <span className="text-[10px] uppercase tracking-wider text-fg-subtle">
+          saved
+        </span>
+      )}
+      {forMode.map((q) => (
+        <span
+          key={q.id}
+          className="inline-flex items-center gap-1 rounded-full border border-border bg-surface px-2 py-0.5 text-[11px] text-fg-muted"
+        >
+          <button
+            type="button"
+            onClick={() => onApply(q)}
+            title={q.text}
+            className="hover:text-fg"
+          >
+            {q.name}
+          </button>
+          <button
+            type="button"
+            onClick={() => onDelete(q.id)}
+            aria-label={`Delete saved query ${q.name}`}
+            className="text-fg-subtle hover:text-danger"
+          >
+            ✕
+          </button>
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function CollapsedEditorBar({
   mode,
   preview,
@@ -692,9 +1208,14 @@ function CollapsedEditorBar({
       <span className="shrink-0 rounded bg-bg px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-fg-subtle">
         {mode === 'graph' ? 'Graph' : 'SQL'}
       </span>
-      <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-fg-muted" title={preview}>
+      <button
+        type="button"
+        onClick={onExpand}
+        title="Click to edit the query"
+        className="min-w-0 flex-1 cursor-text truncate text-left font-mono text-[11px] text-fg-muted transition-colors hover:text-fg"
+      >
         {previewLine || <span className="italic text-fg-subtle">empty query</span>}
-      </span>
+      </button>
       {showCancel ? (
         <button
           onClick={onCancel}
@@ -837,6 +1358,15 @@ function suggestMatch(metadata: ReturnType<typeof useApp.getState>['metadata']):
   }
   if (v0) return `(a IS ${v0.labels[0] ?? v0.alias})`;
   return null;
+}
+
+// Splits a newline-separated textarea into trimmed, non-empty lines. Used for
+// the LATERAL FROM items list.
+function parseLines(text: string): string[] {
+  return text
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
 }
 
 function parseParams(text: string): unknown[] | null {

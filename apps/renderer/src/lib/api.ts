@@ -146,6 +146,17 @@ export interface MetaEvent {
   element_cap?: number;
 }
 
+/**
+ * Server -> client event emitted for EXPLAIN / EXPLAIN ANALYZE requests
+ * (graph or SQL mode). `plan` is the raw JSON the planner returned (the
+ * top-level value of an `EXPLAIN (FORMAT JSON)` array, or the array itself).
+ * The renderer pretty-prints it in a dedicated panel.
+ */
+export interface ExplainEvent {
+  type: 'explain';
+  plan: unknown;
+}
+
 export interface StatsEvent {
   type: 'stats';
   rows: number;
@@ -175,7 +186,8 @@ export type QueryEvent =
   | MetaEvent
   | StatsEvent
   | SummaryEvent
-  | ErrorEvent;
+  | ErrorEvent
+  | ExplainEvent;
 
 export interface Binding {
   alias: string;
@@ -199,6 +211,31 @@ export interface GraphQueryRequest {
    * Omitted ⇒ server applies its own default (10k).
    */
   element_cap?: number;
+  /**
+   * Explicit COLUMNS list for the generated GRAPH_TABLE. Currently the
+   * server auto-projects identity columns regardless; this is reserved for
+   * callers that want to override the projected expression list.
+   */
+  columns?: string[];
+  /**
+   * Extra FROM items placed alongside the GRAPH_TABLE reference (e.g. for a
+   * LATERAL join). The server splices them into the generated SQL.
+   */
+  from?: string[];
+  /**
+   * Alias bound to the GRAPH_TABLE reference when it sits in a LATERAL
+   * position, so outer FROM items can be correlated against it.
+   */
+  lateral_alias?: string;
+  /**
+   * Positional parameters for $1, $2, … referenced from `where` / `from`.
+   * Forwarded to pgx verbatim; pass `null` for a SQL NULL.
+   */
+  params?: unknown[];
+  /** Ask the server to EXPLAIN the generated query instead of running it. */
+  explain?: boolean;
+  /** Ask the server to EXPLAIN ANALYZE (actually executes the query). */
+  explain_analyze?: boolean;
 }
 
 export interface SQLQueryRequest {
@@ -350,6 +387,11 @@ export interface ExpandRequest {
   anchor_pk: string[];
   edge_labels?: string[];
   limit?: number;
+  /**
+   * How many hops to walk out from the anchor. 1 (default) reproduces the
+   * original single-hop neighbourhood; higher values fan out further.
+   */
+  max_depth?: number;
 }
 
 /**
