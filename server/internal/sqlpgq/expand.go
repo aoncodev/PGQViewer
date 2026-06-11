@@ -394,6 +394,16 @@ func buildOneRecursiveExpansion(
 		return ExpansionQuery{}, fmt.Errorf("edge %q is missing endpoint metadata", edge.Alias)
 	}
 
+	// DR-1: cap to a single (correct) hop. The multi-hop WITH RECURSIVE walk
+	// further down has two correctness defects: its frontier carries no
+	// visited-set, so on a cyclic graph it enumerates every walk and grows
+	// exponentially in maxDepth; and its outer reconstruction matches *any* edge
+	// into a reached vertex, emitting hops that were never traversed from the
+	// anchor. Until a path-tracked walk with exact edge reconstruction replaces
+	// it, expansion is always the correct single hop. (The renderer never
+	// requests depth>1, so nothing user-facing changes.)
+	maxDepth = 1
+
 	// Resolve which end of the edge the frontier vertex sits on, and which end
 	// the newly-reached vertex sits on. For "->" the frontier is the source,
 	// the new vertex is the destination; for "<-" it's reversed.
@@ -508,6 +518,10 @@ func buildOneRecursiveExpansion(
 		}, nil
 	}
 
+	// NOTE: unreachable while DR-1 caps maxDepth to 1 above. Retained as the
+	// starting point for a correct rewrite (visited-set + edge-identity in the
+	// frontier); it must not be re-enabled in its current form.
+	//
 	// Multi-hop (self-referential edge): a WITH RECURSIVE walk. The frontier
 	// CTE expands the reachable vertex set up to maxDepth hops; the outer
 	// SELECT then reconstructs each realized hop's (from-vertex, edge,
@@ -617,24 +631,34 @@ func recursiveProjectionColumns(anchor, edge, other *Element) []string {
 		cols = append(cols, fmt.Sprintf("%s.%s AS %s", tableAlias, pgQuoteIdent(sourceCol), pgQuoteIdent(out)))
 	}
 
-	// addProp projects a property. Plain / aliased-column properties read a
-	// real column; computed expression properties emit the expression text
-	// scoped to the table alias. SQL/PGQ stores the expression unqualified
-	// (it refers to the element's own columns), so prefixing the table alias
-	// keeps the reference unambiguous in the multi-table CTE join.
-	addProp := func(tableAlias string, p Property, bindingAlias string) {
+	// addProp projects a property. Plain / aliased-column properties read a real
+	// column. A computed-expression property is evaluated inside an isolated,
+	// single-table subquery correlated by the element's KEY: SQL/PGQ stores the
+	// expression with UNQUALIFIED column references, and the expansion join brings
+	// av/ke/bv into scope at once — which for a self-referential graph are the
+	// SAME table, so an unqualified ref like `(first || last)` fails at runtime
+	// with "column reference is ambiguous". Wrapping it as
+	// `(SELECT (<expr>) FROM <tbl> __e WHERE __e.<key> = <alias>.<key>)` puts only
+	// __e in scope inside the subquery, so the bare refs bind unambiguously, while
+	// the KEY correlation pins __e to the exact row the outer alias holds.
+	addProp := func(tableAlias string, p Property, bindingAlias string, el *Element) {
 		out := bindingAlias + sep + prefixP + sep + p.Name
 		if col, ok := plainPropColumn(p); ok {
 			cols = append(cols, fmt.Sprintf("%s.%s AS %s", tableAlias, pgQuoteIdent(col), pgQuoteIdent(out)))
 			return
 		}
-		// Computed expression: scope unqualified column refs to the table
-		// alias so they resolve in the join. We can't reliably rewrite every
-		// token, so we wrap the raw expression in a derived reference: most
-		// expressions in practice reference the element's own columns, and the
-		// CTE only brings one row per element table into scope, so an
-		// unqualified expression still resolves. Emit it as-is.
 		expr := strings.TrimSpace(*p.Expression)
+		if len(el.PK) > 0 {
+			conds := make([]string, len(el.PK))
+			for i, k := range el.PK {
+				conds[i] = fmt.Sprintf("__e.%s = %s.%s", pgQuoteIdent(k), tableAlias, pgQuoteIdent(k))
+			}
+			cols = append(cols, fmt.Sprintf("(SELECT (%s) FROM %s __e WHERE %s) AS %s",
+				expr, qualTable(el.Table), strings.Join(conds, " AND "), pgQuoteIdent(out)))
+			return
+		}
+		// No KEY to correlate on (shouldn't happen for a graph element): fall back
+		// to the raw expression.
 		cols = append(cols, fmt.Sprintf("(%s) AS %s", expr, pgQuoteIdent(out)))
 	}
 
@@ -645,7 +669,7 @@ func recursiveProjectionColumns(anchor, edge, other *Element) []string {
 		addCol("av", c, "a", prefixPK, c)
 	}
 	for _, p := range anchor.Properties {
-		addProp("av", p, "a")
+		addProp("av", p, "a", anchor)
 	}
 
 	// b (to-vertex), alias "b"
@@ -653,7 +677,7 @@ func recursiveProjectionColumns(anchor, edge, other *Element) []string {
 		addCol("bv", c, "b", prefixPK, c)
 	}
 	for _, p := range other.Properties {
-		addProp("bv", p, "b")
+		addProp("bv", p, "b", other)
 	}
 
 	// k (edge), alias "k"
@@ -661,7 +685,7 @@ func recursiveProjectionColumns(anchor, edge, other *Element) []string {
 		addCol("ke", c, "k", prefixPK, c)
 	}
 	for _, p := range edge.Properties {
-		addProp("ke", p, "k")
+		addProp("ke", p, "k", edge)
 	}
 	if edge.Source != nil {
 		for _, c := range edge.Source.Key {

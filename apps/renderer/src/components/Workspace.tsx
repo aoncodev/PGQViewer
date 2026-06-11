@@ -452,9 +452,11 @@ export function Workspace() {
     setSqlText(sql);
   }
 
-  // Wraps the current MATCH pattern in a runnable GRAPH_TABLE skeleton so the
-  // user can finish it by hand in SQL mode. Used by the 'wrap-graph-table'
-  // hint action and as a fallback when there's no captured SQL.
+  // Wraps the current MATCH pattern in a GRAPH_TABLE starter the user can edit
+  // in SQL mode. PG19 rejects `COLUMNS (a.*)` ("*" is not supported here), so we
+  // enumerate each bound element's declared properties from the graph metadata.
+  // Used by the 'wrap-graph-table' hint action and as a fallback when there's no
+  // captured SQL.
   function wrapMatchAsGraphTable(): string {
     const graphName = metadata
       ? metadata.graph.schema && metadata.graph.schema !== 'public'
@@ -463,7 +465,28 @@ export function Workspace() {
       : 'your_graph';
     const pattern = matchText.trim() || '(a)-[e]->(b)';
     const whereClause = whereText.trim() ? `\n    WHERE ${whereText.trim()}` : '';
-    return `SELECT *\nFROM GRAPH_TABLE (\n  ${graphName}\n  MATCH ${pattern}${whereClause}\n  COLUMNS (a.*)\n);`;
+    return `SELECT *\nFROM GRAPH_TABLE (\n  ${graphName}\n  MATCH ${pattern}${whereClause}\n  COLUMNS (\n    ${buildColumnsList(pattern)}\n  )\n);`;
+  }
+
+  // Builds the COLUMNS list for wrapMatchAsGraphTable. Emits `alias.prop AS
+  // alias_prop` for every property of each element the MATCH binds (resolved via
+  // inferBindings + metadata), because PG19 has no `a.*` star projection. Falls
+  // back to a placeholder comment when bindings/properties can't be resolved —
+  // a template to fill in, but never the invalid `a.*`.
+  function buildColumnsList(pattern: string): string {
+    if (metadata) {
+      const byOid = new Map<number, { properties: { name: string }[] }>();
+      for (const v of metadata.vertices) byOid.set(v.oid, v);
+      for (const e of metadata.edges) byOid.set(e.oid, e);
+      const cols: string[] = [];
+      for (const b of inferBindings(pattern, metadata).bindings) {
+        const el = byOid.get(b.element_oid);
+        if (!el) continue;
+        for (const p of el.properties) cols.push(`${b.alias}.${p.name} AS ${b.alias}_${p.name}`);
+      }
+      if (cols.length > 0) return cols.join(',\n    ');
+    }
+    return '/* PG19 has no a.* — list properties to return, e.g. a.name AS name */';
   }
 
   // Implements the ErrorHintAction kinds surfaced by HintPopover. 'switch-to-

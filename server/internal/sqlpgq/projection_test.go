@@ -162,6 +162,40 @@ func TestFormatPKPart_BoolFloatText(t *testing.T) {
 	}
 }
 
+// TestFormatPKPart_NumericScale pins that NUMERIC values PG considers equal but
+// that arrive with different display scales (e.g. a vertex PK numeric(10,0) and
+// the referencing edge key numeric(10,2)) synthesize the SAME id, so the edge
+// still links to its vertex. Regression for the numeric-scale id fix.
+func TestFormatPKPart_NumericScale(t *testing.T) {
+	md := &sqlpgq.GraphMetadata{
+		Graph: sqlpgq.Graph{Schema: "public", Name: "g"},
+		Vertices: []sqlpgq.Element{{
+			OID: 100, Alias: "v", Kind: "v", PK: []string{"id"},
+			Labels:     []string{"l"},
+			Properties: []sqlpgq.Property{{Name: "id", Type: "numeric"}},
+		}},
+	}
+	pq, err := sqlpgq.BuildProjection(md,
+		[]sqlpgq.Binding{{Alias: "v", ElementOID: 100}}, "(v IS l)", "", 0)
+	if err != nil {
+		t.Fatalf("BuildProjection: %v", err)
+	}
+	id := func(s string) string {
+		n := numericFromString(t, s)
+		evs := pq.Decoder.Decode([]any{n, n})
+		if len(evs) != 1 {
+			t.Fatalf("events=%d, want 1", len(evs))
+		}
+		return evs[0].ID
+	}
+	if a, b := id("42"), id("42.00"); a != b {
+		t.Fatalf("numeric 42 and 42.00 must share an id, got %q vs %q", a, b)
+	}
+	if a, b := id("42.50"), id("42.5"); a != b {
+		t.Fatalf("numeric 42.50 and 42.5 must share an id, got %q vs %q", a, b)
+	}
+}
+
 // TestBuildProjection_CustomColumns checks that a caller-supplied COLUMNS list
 // is emitted verbatim, the query is flagged tabular with a nil decoder, and
 // params are carried through.
@@ -195,6 +229,39 @@ func TestBuildProjection_CustomColumns(t *testing.T) {
 	}
 	if len(pq.Params) != 1 {
 		t.Fatalf("params not carried: %v", pq.Params)
+	}
+}
+
+// TestBuildProjection_LateralForm pins that the lateral From form joins
+// GRAPH_TABLE WITHOUT the LATERAL keyword — PG19 rejects `LATERAL GRAPH_TABLE`,
+// which is already implicitly lateral. Regression for the LATERAL fix.
+func TestBuildProjection_LateralForm(t *testing.T) {
+	md := &sqlpgq.GraphMetadata{
+		Graph: sqlpgq.Graph{Schema: "public", Name: "social"},
+		Vertices: []sqlpgq.Element{{
+			OID: 100, Alias: "people", Kind: "v", PK: []string{"id"},
+			Labels:     []string{"person"},
+			Properties: []sqlpgq.Property{{Name: "id", Type: "integer"}, {Name: "name", Type: "text"}},
+		}},
+	}
+	pq, err := sqlpgq.BuildProjectionWithOpts(sqlpgq.ProjectionOpts{
+		Metadata:     md,
+		Bindings:     []sqlpgq.Binding{{Alias: "a", ElementOID: 100}},
+		Match:        "(a IS person)",
+		LateralFrom:  []string{"(VALUES (1)) v(x)"},
+		LateralAlias: "gt",
+	})
+	if err != nil {
+		t.Fatalf("BuildProjectionWithOpts: %v", err)
+	}
+	if strings.Contains(strings.ToUpper(pq.SQL), "LATERAL") {
+		t.Fatalf("lateral form must NOT contain the LATERAL keyword (PG19 rejects it):\n%s", pq.SQL)
+	}
+	if !strings.Contains(pq.SQL, "GRAPH_TABLE") {
+		t.Fatalf("expected GRAPH_TABLE in lateral form:\n%s", pq.SQL)
+	}
+	if !strings.Contains(pq.SQL, "(VALUES (1)) v(x)") || !strings.Contains(pq.SQL, `"gt"`) {
+		t.Fatalf("lateral From item / alias missing:\n%s", pq.SQL)
 	}
 }
 

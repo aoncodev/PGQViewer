@@ -165,21 +165,20 @@ func (s *Server) Expand(w http.ResponseWriter, r *http.Request) {
 	})
 	flusher.Flush()
 
-	totalRows := 0
-	totalVertices := 0
-	totalEdges := 0
+	// Shared dedup + safety caps across all sub-queries. The expand path
+	// previously applied no row/element/time bound at all (DR-3); a single-hop
+	// expansion of a high-degree hub could stream unboundedly. Mirror the guards
+	// streamGraph enforces on /query, accumulated across sub-queries.
+	es := newExpandStream(enc, flusher, defaultElementCap)
 	var streamErr error
 	for i, q := range queries {
-		subRows := 0
-		subVertices := 0
-		subEdges := 0
-		if err := streamExpandOne(r.Context(), sess.Pool, q.Query, q.Params, enc, flusher, &subRows, &subVertices, &subEdges); err != nil {
+		if es.capHit() {
+			break
+		}
+		if err := streamExpandOne(r.Context(), sess.Pool, q.Query, q.Params, es); err != nil {
 			streamErr = fmt.Errorf("subquery %d: %w", i, err)
 			break
 		}
-		totalRows += subRows
-		totalVertices += subVertices
-		totalEdges += subEdges
 	}
 
 	elapsed := time.Since(start).Milliseconds()
@@ -191,12 +190,19 @@ func (s *Server) Expand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = enc.Encode(map[string]any{
-		"type":     "stats",
-		"rows":     totalRows,
-		"vertices": totalVertices,
-		"edges":    totalEdges,
-	})
+	// Report UNIQUE elements (post-dedup), matching streamGraph — the old
+	// per-subquery sum double-counted vertices shared across sub-queries.
+	stats := map[string]any{
+		"type":      "stats",
+		"rows":      es.scanned,
+		"vertices":  len(es.seenV),
+		"edges":     len(es.seenE),
+		"truncated": es.truncated,
+	}
+	if es.reason != "" {
+		stats["truncated_reason"] = es.reason
+	}
+	_ = enc.Encode(stats)
 	_ = enc.Encode(map[string]any{
 		"type":       "summary",
 		"elapsed_ms": elapsed,
@@ -204,56 +210,110 @@ func (s *Server) Expand(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 }
 
-// streamExpandOne runs one sub-query of an expansion. It mirrors streamGraph
-// but writes its row/vertex/edge counters into the caller's accumulator
-// pointers so the overall handler can emit a single stats event covering
-// every sub-query.
-func streamExpandOne(
-	ctx context.Context,
-	pool poolQuerier,
-	pq *sqlpgq.ProjectedQuery,
-	params []any,
-	enc *json.Encoder,
-	flusher http.Flusher,
-	rowsOut, vertOut, edgeOut *int,
-) error {
+// expandStream accumulates dedup + safety-cap state across an expansion's
+// sub-queries. The /expand path otherwise had no row/element/time bound (DR-3);
+// these mirror the guards streamGraph enforces on /query so a high-degree
+// expansion can't stream without limit. Dedup by synthetic id also gives the
+// element cap a precise "unique elements" meaning and stops shared endpoints
+// from being double-counted across sub-queries.
+type expandStream struct {
+	enc        *json.Encoder
+	flusher    http.Flusher
+	seenV      map[string]struct{}
+	seenE      map[string]struct{}
+	scanned    int // raw rows scanned across all sub-queries
+	deadline   time.Time
+	elementCap int // post-dedup unique-element cap
+	truncated  bool
+	reason     string // "element_cap" | "scanned_rows" | "wall_clock"
+}
+
+func newExpandStream(enc *json.Encoder, flusher http.Flusher, elementCap int) *expandStream {
+	if elementCap <= 0 {
+		elementCap = defaultElementCap
+	}
+	return &expandStream{
+		enc:        enc,
+		flusher:    flusher,
+		seenV:      map[string]struct{}{},
+		seenE:      map[string]struct{}{},
+		deadline:   time.Now().Add(defaultGraphWallClock),
+		elementCap: elementCap,
+	}
+}
+
+// capHit reports whether a safety cap has been reached, recording which one.
+func (es *expandStream) capHit() bool {
+	switch {
+	case es.truncated:
+		return true
+	case len(es.seenV)+len(es.seenE) >= es.elementCap:
+		es.truncated, es.reason = true, "element_cap"
+	case es.scanned >= defaultScannedRowCap:
+		es.truncated, es.reason = true, "scanned_rows"
+	case time.Now().After(es.deadline):
+		es.truncated, es.reason = true, "wall_clock"
+	default:
+		return false
+	}
+	return true
+}
+
+// streamExpandOne runs one sub-query of an expansion, emitting deduplicated
+// vertex/edge events into the shared expandStream and honouring its caps.
+func streamExpandOne(ctx context.Context, pool poolQuerier, pq *sqlpgq.ProjectedQuery, params []any, es *expandStream) error {
 	rows, err := pool.Query(ctx, pq.SQL, params...)
 	if err != nil {
 		return fmt.Errorf("query: %w", err)
 	}
 	defer rows.Close()
 
-	rowCount := 0
-	vertexCount := 0
-	edgeCount := 0
-
 	for rows.Next() {
+		if es.capHit() {
+			break
+		}
 		vals, err := rows.Values()
 		if err != nil {
-			return fmt.Errorf("scan row %d: %w", rowCount, err)
+			return fmt.Errorf("scan row %d: %w", es.scanned, err)
 		}
+		// Ids from the raw row (pre-jsonify), properties from the jsonified row —
+		// see RowDecoder.DecodeRaw.
+		raw := append([]any(nil), vals...)
 		jsonifyRow(vals)
-		for _, ev := range pq.Decoder.Decode(vals) {
-			if err := enc.Encode(ev); err != nil {
-				return fmt.Errorf("encode event: %w", err)
-			}
+		for _, ev := range pq.Decoder.DecodeRaw(raw, vals) {
+			// Drop already-seen ids so the element cap counts unique elements.
 			switch ev.Kind {
 			case sqlpgq.EventVertex:
-				vertexCount++
+				if _, dup := es.seenV[ev.ID]; dup {
+					continue
+				}
+				es.seenV[ev.ID] = struct{}{}
 			case sqlpgq.EventEdge:
-				edgeCount++
+				if _, dup := es.seenE[ev.ID]; dup {
+					continue
+				}
+				es.seenE[ev.ID] = struct{}{}
+			}
+			if err := es.enc.Encode(ev); err != nil {
+				return fmt.Errorf("encode event: %w", err)
+			}
+			if len(es.seenV)+len(es.seenE) >= es.elementCap {
+				es.truncated, es.reason = true, "element_cap"
+				break
 			}
 		}
-		rowCount++
-		if rowCount%flushEvery == 0 {
-			flusher.Flush()
+		es.scanned++
+		if es.scanned%flushEvery == 0 {
+			es.flusher.Flush()
+		}
+		if es.truncated {
+			break
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return err
+	if !es.truncated {
+		if err := rows.Err(); err != nil {
+			return err
+		}
 	}
-	*rowsOut = rowCount
-	*vertOut = vertexCount
-	*edgeOut = edgeCount
 	return nil
 }

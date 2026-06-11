@@ -34,7 +34,8 @@ type queryRequest struct {
 	Limit    int              `json:"limit,omitempty"`
 	Bindings []sqlpgq.Binding `json:"bindings,omitempty"`
 	// Optional lateral form: when From is non-empty, the projection becomes
-	//   SELECT * FROM <From...>, LATERAL GRAPH_TABLE (...) <LateralAlias>
+	//   SELECT * FROM <From...>, GRAPH_TABLE (...) <LateralAlias>
+	// (GRAPH_TABLE is implicitly lateral; PG19 rejects an explicit LATERAL here)
 	// From items are raw SQL fragments — caller-supplied, caller-trusted.
 	From         []string `json:"from,omitempty"`
 	LateralAlias string   `json:"lateral_alias,omitempty"`
@@ -385,8 +386,12 @@ func streamGraph(ctx context.Context, pool poolQuerier, pq *sqlpgq.ProjectedQuer
 		if err != nil {
 			return fmt.Errorf("scan row %d: %w", rowCount, err)
 		}
+		// Synthesize ids from the raw row (before jsonifyRow rewrites numerics
+		// and friends into id-unstable display forms); properties use the
+		// jsonified row. See RowDecoder.DecodeRaw.
+		raw := append([]any(nil), vals...)
 		jsonifyRow(vals)
-		for _, ev := range pq.Decoder.Decode(vals) {
+		for _, ev := range pq.Decoder.DecodeRaw(raw, vals) {
 			// Drop already-seen ids quietly. Saves bytes on the wire and
 			// gives our cap a precise meaning ("unique elements" not
 			// "decode events").

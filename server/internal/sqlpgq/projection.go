@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,6 +32,13 @@ type Binding struct {
 	Alias             string   `json:"alias"`
 	ElementOID        uint32   `json:"element_oid"`
 	DisplayProperties []string `json:"display_properties,omitempty"`
+	// Label is the label the MATCH pattern bound this alias to (`(a IS person)`
+	// → "person"), as parsed client-side. When set, the auto-projection scopes
+	// the projected properties to those declared on that label — SQL/PGQ rejects
+	// `a.<prop>` for a property not on the bound label. Empty (an unlabeled
+	// pattern `(a)`, or any non-GRAPH_TABLE caller) keeps the full property union,
+	// which PG also accepts.
+	Label string `json:"label,omitempty"`
 }
 
 // ProjectedQuery is the result of BuildProjection.
@@ -134,7 +142,10 @@ const (
 //
 // LateralFrom: when non-empty, the outer SELECT becomes
 //
-//	SELECT * FROM <from1>, <from2>, ..., LATERAL GRAPH_TABLE(...) <alias>
+//	SELECT * FROM <from1>, <from2>, ..., GRAPH_TABLE(...) <alias>
+//
+// (no LATERAL keyword: PG19 rejects it before GRAPH_TABLE, which is implicitly
+// lateral, so a plain comma join both parses and correlates.)
 //
 // instead of `SELECT * FROM GRAPH_TABLE(...)`. From items are raw SQL
 // fragments — the caller is responsible for quoting / safety. LateralAlias
@@ -285,18 +296,27 @@ func BuildProjectionWithOpts(opts ProjectionOpts) (*ProjectedQuery, error) {
 		// column) instead of projecting everything. PK and edge keys are
 		// still always projected (handled outside this loop), and the
 		// trim is recorded so the client can request the full set.
+		// F3: scope to the matched label. PG19 binds an element variable to the
+		// label named in the pattern, and `a.<prop>` is valid only for a property
+		// of that label. The client sends the parsed label; an empty Label
+		// (unlabeled `(a)`) keeps the full union, which PG also accepts.
+		scopedProps := el.Properties
+		if b.Label != "" {
+			scopedProps = propertiesForLabel(el.Properties, b.Label)
+		}
+
 		effectiveDisplay := b.DisplayProperties
 		var didTrim bool
-		if len(effectiveDisplay) == 0 && len(el.Properties) > wideElementPropertyThreshold {
-			effectiveDisplay = heuristicDisplayProperties(el)
+		if len(effectiveDisplay) == 0 && len(scopedProps) > wideElementPropertyThreshold {
+			effectiveDisplay = heuristicDisplayProperties(scopedProps)
 			didTrim = true
 		}
-		propFilter, err := makePropertyFilter(effectiveDisplay, el)
+		propFilter, err := makePropertyFilter(effectiveDisplay, scopedProps, el.Alias)
 		if err != nil {
 			return nil, fmt.Errorf("binding %q: %w", b.Alias, err)
 		}
 		var projectedProps []string
-		for _, p := range el.Properties {
+		for _, p := range scopedProps {
 			if !propFilter(p.Name) {
 				continue
 			}
@@ -309,7 +329,7 @@ func BuildProjectionWithOpts(opts ProjectionOpts) (*ProjectedQuery, error) {
 			trimmed = append(trimmed, TrimInfo{
 				Alias:      b.Alias,
 				ElementOID: el.OID,
-				Total:      len(el.Properties),
+				Total:      len(scopedProps),
 				Projected:  projectedProps,
 			})
 		}
@@ -416,8 +436,9 @@ func graphTableBlock(md *GraphMetadata, match, where string, cols []string) stri
 }
 
 // assembleSQL builds the final statement from the projected COLUMNS list.
-// When opts.LateralFrom is non-empty the GRAPH_TABLE is joined laterally
-// after those FROM items; otherwise it is the sole FROM item.
+// When opts.LateralFrom is non-empty the GRAPH_TABLE is joined as a plain comma
+// FROM item (it is implicitly lateral) after those FROM items; otherwise it is
+// the sole FROM item.
 func assembleSQL(md *GraphMetadata, cols []string, opts ProjectionOpts) (string, error) {
 	// Filter out empty/whitespace-only From items so callers can pass nil
 	// or an unfiltered slice without changing the default code path.
@@ -441,7 +462,10 @@ func assembleSQL(md *GraphMetadata, cols []string, opts ProjectionOpts) (string,
 		}
 		sb.WriteString("SELECT * FROM ")
 		sb.WriteString(strings.Join(fromItems, ", "))
-		sb.WriteString(", LATERAL ")
+		// GRAPH_TABLE is implicitly lateral in PG19; the explicit LATERAL keyword
+		// is a syntax error before it. Joining it as a plain comma FROM item still
+		// lets the pattern correlate to the preceding From items.
+		sb.WriteString(", ")
 		sb.WriteString(block)
 		sb.WriteString(" ")
 		sb.WriteString(pgQuoteIdent(alias))
@@ -509,13 +533,29 @@ type propRef struct {
 	name string
 }
 
-// Decode produces one Event per binding for the given row. If any of the
-// PK values are NULL for a binding (which happens with outer-join-shaped
-// matches — not in v0 PG19, but defensive anyway), the binding is skipped.
+// Decode produces one Event per binding for the given row, synthesizing ids
+// from the same row used for property values. Equivalent to DecodeRaw(row, row).
 func (d *RowDecoder) Decode(values []any) []Event {
+	return d.DecodeRaw(values, values)
+}
+
+// DecodeRaw is Decode but derives synthetic ids (vertex PK, edge endpoint keys)
+// from idVals while reading property values from propVals.
+//
+// Callers that mutate the row for JSON output (jsonifyRow) MUST pass the
+// untouched raw row as idVals: jsonify rewrites some values into display-
+// friendly but id-unstable forms — most importantly a NUMERIC loses its scale
+// distinction, so a vertex PK numeric(10,0) and the referencing edge key
+// numeric(10,2) would stringify to "42" vs "42.00" and never link. Deriving ids
+// from the raw pgtype values (where formatPKPart canonicalizes them) keeps the
+// two sides equal. idVals and propVals must be index-compatible.
+//
+// If any PK value is NULL for a binding (outer-join-shaped matches — not in v0
+// PG19, but defensive), the binding is skipped.
+func (d *RowDecoder) DecodeRaw(idVals, propVals []any) []Event {
 	out := make([]Event, 0, len(d.Bindings))
 	for _, b := range d.Bindings {
-		pk, ok := joinKey(values, b.pkCols)
+		pk, ok := joinKey(idVals, b.pkCols)
 		if !ok {
 			continue
 		}
@@ -526,17 +566,17 @@ func (d *RowDecoder) Decode(values []any) []Event {
 			ID:         fmt.Sprintf("%d:%s", b.ElementOID, pk),
 		}
 		for _, p := range b.propCols {
-			ev.Properties[p.name] = values[p.idx]
+			ev.Properties[p.name] = propVals[p.idx]
 		}
 		switch b.Kind {
 		case "v":
 			ev.Kind = EventVertex
 		case "e":
 			ev.Kind = EventEdge
-			if sk, ok := joinKey(values, b.srcKeyCols); ok && b.srcVertexOID != 0 {
+			if sk, ok := joinKey(idVals, b.srcKeyCols); ok && b.srcVertexOID != 0 {
 				ev.Source = fmt.Sprintf("%d:%s", b.srcVertexOID, sk)
 			}
-			if dk, ok := joinKey(values, b.dstKeyCols); ok && b.dstVertexOID != 0 {
+			if dk, ok := joinKey(idVals, b.dstKeyCols); ok && b.dstVertexOID != 0 {
 				ev.Destination = fmt.Sprintf("%d:%s", b.dstVertexOID, dk)
 			}
 		default:
@@ -682,7 +722,7 @@ func formatPKPart(v any) string {
 			return fmt.Sprintf("%v", v)
 		}
 		if str, ok := s.(string); ok {
-			return str
+			return normalizeNumericText(str)
 		}
 		return fmt.Sprintf("%v", s)
 	case time.Time:
@@ -707,6 +747,23 @@ func formatPKPart(v any) string {
 	default:
 		return fmt.Sprintf("%v", v)
 	}
+}
+
+// normalizeNumericText canonicalizes a NUMERIC's text form for id synthesis.
+// PostgreSQL treats 42, 42.0 and 42.00 as equal, but pgtype.Numeric.Value()
+// preserves the display scale, so a vertex PK and the referencing edge key
+// declared with different scales would otherwise synthesize mismatched ids and
+// fail to link on the canvas. We strip trailing fractional zeros (and a bare
+// trailing dot). NaN / Infinity / scientific forms are left untouched.
+func normalizeNumericText(s string) string {
+	if !strings.Contains(s, ".") {
+		return s
+	}
+	if strings.ContainsAny(s, "eEnN") { // scientific / NaN / Infinity
+		return s
+	}
+	s = strings.TrimRight(s, "0")
+	return strings.TrimRight(s, ".")
 }
 
 // FormatUUIDBytes returns the canonical lowercase 8-4-4-4-12 UUID form for
@@ -736,18 +793,18 @@ func projectColumn(alias, propName, outName string) string {
 // a "should I project this?" predicate. Empty list means "yes to all";
 // names that don't exist on the element are an error so the caller hears
 // about typos rather than silently dropping data.
-func makePropertyFilter(allow []string, el *Element) (func(string) bool, error) {
+func makePropertyFilter(allow []string, props []Property, elemAlias string) (func(string) bool, error) {
 	if len(allow) == 0 {
 		return func(string) bool { return true }, nil
 	}
-	declared := make(map[string]struct{}, len(el.Properties))
-	for _, p := range el.Properties {
+	declared := make(map[string]struct{}, len(props))
+	for _, p := range props {
 		declared[p.Name] = struct{}{}
 	}
 	want := make(map[string]struct{}, len(allow))
 	for _, name := range allow {
 		if _, ok := declared[name]; !ok {
-			return nil, fmt.Errorf("display_properties names %q which is not a declared property of element %q", name, el.Alias)
+			return nil, fmt.Errorf("display_properties names %q which is not a declared property of element %q", name, elemAlias)
 		}
 		want[name] = struct{}{}
 	}
@@ -776,27 +833,40 @@ func nonEmptyTrimmed(in []string) []string {
 // the first text-typed property, then — failing both — the first declared
 // property so we never project an empty body. PK / edge keys are added by the
 // caller regardless, so this only governs the descriptive payload.
-func heuristicDisplayProperties(el *Element) []string {
+func heuristicDisplayProperties(props []Property) []string {
 	nameish := map[string]struct{}{
 		"name": {}, "title": {}, "label": {}, "display_name": {}, "displayname": {},
 	}
 	// First pass: a conventional name-ish column (case-insensitive).
-	for _, p := range el.Properties {
+	for _, p := range props {
 		if _, ok := nameish[strings.ToLower(p.Name)]; ok {
 			return []string{p.Name}
 		}
 	}
 	// Second pass: the first text-ish property.
-	for _, p := range el.Properties {
+	for _, p := range props {
 		if isTextType(p.Type) {
 			return []string{p.Name}
 		}
 	}
 	// Fallback: the first declared property, if any.
-	if len(el.Properties) > 0 {
-		return []string{el.Properties[0].Name}
+	if len(props) > 0 {
+		return []string{props[0].Name}
 	}
 	return nil
+}
+
+// propertiesForLabel returns the subset of props declared on the given label.
+// A property with no Labels recorded (e.g. older metadata) is conservatively
+// kept, so scoping never silently drops a property it can't classify.
+func propertiesForLabel(props []Property, label string) []Property {
+	out := make([]Property, 0, len(props))
+	for _, p := range props {
+		if len(p.Labels) == 0 || slices.Contains(p.Labels, label) {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // isTextType reports whether a declared property type name is a textual SQL

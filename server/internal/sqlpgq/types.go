@@ -87,6 +87,12 @@ type Property struct {
 	// reference it'll match Name; for a computed property like `i + j AS k`
 	// it carries the expression text.
 	Expression *string `json:"expression,omitempty"`
+	// Labels lists every label of the element on which this property is
+	// declared. SQL/PGQ scopes property references to the matched label, so a
+	// GRAPH_TABLE COLUMNS list bound to `IS <label>` may only project
+	// properties whose Labels contains that label. A property declared on
+	// several labels (e.g. via PROPERTIES ALL COLUMNS) carries them all.
+	Labels []string `json:"labels,omitempty"`
 }
 
 // LabelCount carries the row count of an element's underlying table along
@@ -99,4 +105,3 @@ type LabelCount struct {
 	Labels     []string `json:"labels"`
 	Count      int64    `json:"count"`
 }
-

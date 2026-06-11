@@ -80,9 +80,9 @@ test('binds vertex alias to vertex element, edge alias to edge element', () => {
   const r = inferBindings('(a IS person)-[k IS knows]->(b IS person)', meta);
   expect(r.error).toBeUndefined();
   expect(r.bindings.sort((x, y) => x.alias.localeCompare(y.alias))).toEqual([
-    { alias: 'a', element_oid: 100 },
-    { alias: 'b', element_oid: 100 },
-    { alias: 'k', element_oid: 200 },
+    { alias: 'a', element_oid: 100, label: 'person' },
+    { alias: 'b', element_oid: 100, label: 'person' },
+    { alias: 'k', element_oid: 200, label: 'knows' },
   ]);
 });
 
@@ -236,4 +236,26 @@ test('alias-less IS form in a vertex ((IS person)) parses as label-only', () => 
   expect(r.error).toBeUndefined();
   const aliases = r.bindings.map((b) => b.alias).sort();
   expect(aliases).toEqual(['a', 'k']);
+});
+
+// ───────── identifier folding (PG folds unquoted identifiers to lowercase) ─────
+
+test('uppercase/mixed-case aliases are folded to lowercase to match PG', () => {
+  // PG folds the unquoted A/K/B in the verbatim MATCH to lowercase; the binding
+  // alias must match so the server's quoted COLUMNS ("a"."prop") references a
+  // variable that still exists after folding (else "missing FROM-clause entry").
+  const r = inferBindings('(A IS person)-[K IS knows]->(B IS person)', meta);
+  expect(r.error).toBeUndefined();
+  expect(r.bindings.map((b) => b.alias).sort()).toEqual(['a', 'b', 'k']);
+});
+
+test('mixed-case labels resolve against the (lowercase) catalog label', () => {
+  // `IS Person` / `IS PERSON` fold to `person`, which is how PG stores and
+  // matches an unquoted label — so resolution must still succeed.
+  const r = inferBindings('(a IS Person)-[k IS Knows]->(b IS PERSON)', meta);
+  expect(r.error).toBeUndefined();
+  const byAlias = new Map(r.bindings.map((b) => [b.alias, b.element_oid]));
+  expect(byAlias.get('a')).toBe(100);
+  expect(byAlias.get('b')).toBe(100);
+  expect(byAlias.get('k')).toBe(200);
 });

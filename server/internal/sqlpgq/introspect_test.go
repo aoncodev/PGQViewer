@@ -251,7 +251,11 @@ func TestBuildRecursiveExpansion_OneHopIsPlainJoinWithParams(t *testing.T) {
 	}
 }
 
-func TestBuildRecursiveExpansion_MultiHopUsesRecursiveCTE(t *testing.T) {
+// TestBuildRecursiveExpansion_MultiHopCappedToSingleHop pins DR-1: multi-hop
+// (maxDepth>1) is disabled because the WITH RECURSIVE walk had correctness
+// (spurious edges) and termination (no visited-set → exponential) bugs, so a
+// deeper request falls back to the correct single hop — no recursion.
+func TestBuildRecursiveExpansion_MultiHopCappedToSingleHop(t *testing.T) {
 	md, anchor := selfRefGraph()
 	qs, err := sqlpgq.BuildRecursiveExpansion(md, anchor, []string{"3"}, nil, 0, 3)
 	if err != nil {
@@ -261,11 +265,8 @@ func TestBuildRecursiveExpansion_MultiHopUsesRecursiveCTE(t *testing.T) {
 		t.Fatalf("want 2 queries, got %d", len(qs))
 	}
 	for _, q := range qs {
-		if !strings.Contains(q.Query.SQL, "WITH RECURSIVE frontier") {
-			t.Errorf("multi-hop query should use WITH RECURSIVE:\n%s", q.Query.SQL)
-		}
-		if !strings.Contains(q.Query.SQL, "fr.depth < 3") {
-			t.Errorf("multi-hop query should bound depth at 3:\n%s", q.Query.SQL)
+		if strings.Contains(q.Query.SQL, "RECURSIVE") {
+			t.Errorf("multi-hop must be capped to a single hop (no recursion):\n%s", q.Query.SQL)
 		}
 		if len(q.Params) != 1 || q.Params[0] != "3" {
 			t.Errorf("want params [3], got %v", q.Params)

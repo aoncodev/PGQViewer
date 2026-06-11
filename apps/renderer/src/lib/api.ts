@@ -62,6 +62,13 @@ export interface Property {
   name: string;
   type: string;
   expression?: string;
+  /**
+   * Labels of the element on which this property is declared. SQL/PGQ scopes
+   * `alias.<prop>` to the matched label, so a property is only projectable
+   * under a `IS <label>` binding when its labels include that label. Absent on
+   * older server builds (treat as "applies to all of the element's labels").
+   */
+  labels?: string[];
 }
 
 export interface EdgeEnd {
@@ -197,6 +204,11 @@ export interface Binding {
   // Empty / missing keeps today's behaviour of projecting every
   // declared property. See server/internal/sqlpgq/projection.go.
   display_properties?: string[];
+  // The label this alias was matched against (`(a IS person)` → "person"),
+  // when the pattern named one. The server scopes the projected COLUMNS to
+  // that label's properties, since PG19 rejects `a.<prop>` for a property not
+  // on the bound label. Omitted for an unlabeled pattern `(a)`.
+  label?: string;
 }
 
 export interface GraphQueryRequest {

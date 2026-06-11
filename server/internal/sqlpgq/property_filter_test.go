@@ -114,3 +114,48 @@ func TestDisplayProperties_UnknownNameErrors(t *testing.T) {
 		t.Errorf("error should name the unknown property, got: %v", err)
 	}
 }
+
+// TestBuildProjection_ScopesToMatchedLabel pins the F3 fix: a binding that names
+// a label projects only that label's properties (PG19 rejects `a.<prop>` for a
+// property not on the bound label), while an unlabeled binding keeps the union.
+func TestBuildProjection_ScopesToMatchedLabel(t *testing.T) {
+	// One element, two labels with DIFFERENT property sets — the F3 shape.
+	// person -> {id, name}; employee -> {id, salary}; id is shared.
+	md := &sqlpgq.GraphMetadata{
+		Graph: sqlpgq.Graph{Schema: "public", Name: "facets"},
+		Vertices: []sqlpgq.Element{{
+			OID: 700, Alias: "people", Kind: "v", PK: []string{"id"},
+			Labels: []string{"person", "employee"},
+			Properties: []sqlpgq.Property{
+				{Name: "id", Type: "integer", Labels: []string{"employee", "person"}},
+				{Name: "name", Type: "text", Labels: []string{"person"}},
+				{Name: "salary", Type: "integer", Labels: []string{"employee"}},
+			},
+		}},
+	}
+
+	// Bound to "person": must project id + name, NOT salary (employee-only) —
+	// otherwise PG raises `property "salary" for element variable "a" not found`.
+	pq, err := sqlpgq.BuildProjection(md,
+		[]sqlpgq.Binding{{Alias: "a", ElementOID: 700, Label: "person"}},
+		"(a IS person)", "", 0)
+	if err != nil {
+		t.Fatalf("BuildProjection (person): %v", err)
+	}
+	if !strings.Contains(pq.SQL, "a__p__name") {
+		t.Errorf("person-scoped projection should include name:\n%s", pq.SQL)
+	}
+	if strings.Contains(pq.SQL, "a__p__salary") {
+		t.Errorf("person-scoped projection must NOT include employee-only salary:\n%s", pq.SQL)
+	}
+
+	// Unlabeled binding keeps the union (PG allows projecting any label's prop).
+	pqAll, err := sqlpgq.BuildProjection(md,
+		[]sqlpgq.Binding{{Alias: "a", ElementOID: 700}}, "(a)", "", 0)
+	if err != nil {
+		t.Fatalf("BuildProjection (unlabeled): %v", err)
+	}
+	if !strings.Contains(pqAll.SQL, "a__p__name") || !strings.Contains(pqAll.SQL, "a__p__salary") {
+		t.Errorf("unlabeled projection should keep the full union:\n%s", pqAll.SQL)
+	}
+}
