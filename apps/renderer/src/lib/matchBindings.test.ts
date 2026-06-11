@@ -80,9 +80,9 @@ test('binds vertex alias to vertex element, edge alias to edge element', () => {
   const r = inferBindings('(a IS person)-[k IS knows]->(b IS person)', meta);
   expect(r.error).toBeUndefined();
   expect(r.bindings.sort((x, y) => x.alias.localeCompare(y.alias))).toEqual([
-    { alias: 'a', element_oid: 100 },
-    { alias: 'b', element_oid: 100 },
-    { alias: 'k', element_oid: 200 },
+    { alias: 'a', element_oid: 100, label: 'person' },
+    { alias: 'b', element_oid: 100, label: 'person' },
+    { alias: 'k', element_oid: 200, label: 'knows' },
   ]);
 });
 

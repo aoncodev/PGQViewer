@@ -58,10 +58,14 @@ export function discoverLabelProperties(
       ...(kinds.includes('e') ? src.metadata.edges : []),
     ];
     for (const el of els) {
-      for (const lab of el.labels) {
-        for (const p of el.properties) {
-          if (keep({ name: p.name, type: p.type })) add(lab, p.name);
-        }
+      for (const p of el.properties) {
+        if (!keep({ name: p.name, type: p.type })) continue;
+        // Pair the property only with the labels it is actually declared on —
+        // SQL/PGQ scopes properties per label, so an element's labels do not all
+        // share its property set. Fall back to the element's labels for older
+        // server metadata that doesn't carry per-property labels.
+        const labels = p.labels && p.labels.length > 0 ? p.labels : el.labels;
+        for (const lab of labels) add(lab, p.name);
       }
     }
   }

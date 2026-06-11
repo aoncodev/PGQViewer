@@ -115,6 +115,9 @@ export function inferBindings(
       alias: parsed.alias,
       element_oid: el.elementOID!,
       kind: chunk.kind,
+      // Carry the matched label so the server can scope the projected COLUMNS to
+      // it (SQL/PGQ rejects a property not on the bound label). Unlabeled → none.
+      ...(parsed.label ? { label: parsed.label } : {}),
     });
   }
 
@@ -148,9 +151,10 @@ export function inferBindings(
   }
 
   return {
-    bindings: Array.from(byAlias.values()).map(({ alias, element_oid }) => ({
+    bindings: Array.from(byAlias.values()).map(({ alias, element_oid, label }) => ({
       alias,
       element_oid,
+      ...(label ? { label } : {}),
     })),
     ...(warnings.length > 0 ? { warnings } : {}),
   };

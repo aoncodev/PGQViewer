@@ -565,19 +565,35 @@ func attachProperties(ctx context.Context, db rowQuerier, graphOID uint32, byOID
 		return fmt.Errorf("element properties: %w", err)
 	}
 	defer rows.Close()
+	// element_properties.sql emits one row per (element, property, label). Collapse
+	// to one Property per name whose Labels lists every label it is declared on, so
+	// the projection can scope a `IS <label>` binding to the right property subset.
+	idxByElemProp := map[uint32]map[string]int{}
 	for rows.Next() {
 		var (
-			elOID uint32
-			p     Property
-			expr  *string
+			elOID     uint32
+			name, typ string
+			expr      *string
+			label     string
 		)
-		if err := rows.Scan(&elOID, &p.Name, &p.Type, &expr); err != nil {
+		if err := rows.Scan(&elOID, &name, &typ, &expr, &label); err != nil {
 			return fmt.Errorf("scan property: %w", err)
 		}
-		p.Expression = expr
-		if e, ok := byOID[elOID]; ok {
-			e.Properties = append(e.Properties, p)
+		e, ok := byOID[elOID]
+		if !ok {
+			continue
 		}
+		if idxByElemProp[elOID] == nil {
+			idxByElemProp[elOID] = map[string]int{}
+		}
+		if i, seen := idxByElemProp[elOID][name]; seen {
+			e.Properties[i].Labels = append(e.Properties[i].Labels, label)
+			continue
+		}
+		e.Properties = append(e.Properties, Property{
+			Name: name, Type: typ, Expression: expr, Labels: []string{label},
+		})
+		idxByElemProp[elOID][name] = len(e.Properties) - 1
 	}
 	return rows.Err()
 }

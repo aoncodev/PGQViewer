@@ -394,6 +394,16 @@ func buildOneRecursiveExpansion(
 		return ExpansionQuery{}, fmt.Errorf("edge %q is missing endpoint metadata", edge.Alias)
 	}
 
+	// DR-1: cap to a single (correct) hop. The multi-hop WITH RECURSIVE walk
+	// further down has two correctness defects: its frontier carries no
+	// visited-set, so on a cyclic graph it enumerates every walk and grows
+	// exponentially in maxDepth; and its outer reconstruction matches *any* edge
+	// into a reached vertex, emitting hops that were never traversed from the
+	// anchor. Until a path-tracked walk with exact edge reconstruction replaces
+	// it, expansion is always the correct single hop. (The renderer never
+	// requests depth>1, so nothing user-facing changes.)
+	maxDepth = 1
+
 	// Resolve which end of the edge the frontier vertex sits on, and which end
 	// the newly-reached vertex sits on. For "->" the frontier is the source,
 	// the new vertex is the destination; for "<-" it's reversed.
@@ -508,6 +518,10 @@ func buildOneRecursiveExpansion(
 		}, nil
 	}
 
+	// NOTE: unreachable while DR-1 caps maxDepth to 1 above. Retained as the
+	// starting point for a correct rewrite (visited-set + edge-identity in the
+	// frontier); it must not be re-enabled in its current form.
+	//
 	// Multi-hop (self-referential edge): a WITH RECURSIVE walk. The frontier
 	// CTE expands the reachable vertex set up to maxDepth hops; the outer
 	// SELECT then reconstructs each realized hop's (from-vertex, edge,
