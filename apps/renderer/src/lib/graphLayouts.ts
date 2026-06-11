@@ -72,7 +72,15 @@ export function styleFor(
         'text-valign': 'bottom',
         'text-halign': 'center',
         'text-margin-y': 7,
-        'text-outline-width': 0,
+        // Wrap long captions (film titles, full names) onto 1–2 lines instead
+        // of rendering as one wide line that overlaps neighbouring nodes/labels.
+        'text-wrap': 'wrap',
+        'text-max-width': 130,
+        // Halo: a 2px outline in the near-canvas-bg colour (labelOutline, from
+        // lib/colors.ts) so the caption stays legible where it crosses edges or
+        // other elements. Previously computed per node but never applied.
+        'text-outline-width': 2,
+        'text-outline-color': 'data(labelOutline)',
       };
   return [
     {
