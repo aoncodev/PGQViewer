@@ -230,13 +230,15 @@ export interface GraphQueryRequest {
    */
   columns?: string[];
   /**
-   * Extra FROM items placed alongside the GRAPH_TABLE reference (e.g. for a
-   * LATERAL join). The server splices them into the generated SQL.
+   * Extra FROM items placed alongside the GRAPH_TABLE reference, so outer rows
+   * can correlate to the pattern. The server joins GRAPH_TABLE as a plain comma
+   * FROM item — it is implicitly lateral, and PG19 rejects an explicit LATERAL
+   * keyword before it.
    */
   from?: string[];
   /**
-   * Alias bound to the GRAPH_TABLE reference when it sits in a LATERAL
-   * position, so outer FROM items can be correlated against it.
+   * Alias bound to the GRAPH_TABLE reference so the `from` items can correlate
+   * against it. (GRAPH_TABLE is implicitly lateral; no LATERAL keyword is used.)
    */
   lateral_alias?: string;
   /**

@@ -475,14 +475,24 @@ export function Workspace() {
   // a template to fill in, but never the invalid `a.*`.
   function buildColumnsList(pattern: string): string {
     if (metadata) {
-      const byOid = new Map<number, { properties: { name: string }[] }>();
+      const byOid = new Map<
+        number,
+        { properties: { name: string; labels?: string[] }[] }
+      >();
       for (const v of metadata.vertices) byOid.set(v.oid, v);
       for (const e of metadata.edges) byOid.set(e.oid, e);
       const cols: string[] = [];
       for (const b of inferBindings(pattern, metadata).bindings) {
         const el = byOid.get(b.element_oid);
         if (!el) continue;
-        for (const p of el.properties) cols.push(`${b.alias}.${p.name} AS ${b.alias}_${p.name}`);
+        for (const p of el.properties) {
+          // Scope to the matched label, like the server projection: PG19 rejects
+          // `a.<prop>` for a property not on the bound label, so for a divergent
+          // multi-label element we must not project the union. Unlabeled
+          // bindings (no b.label) keep every property.
+          if (b.label && p.labels && p.labels.length > 0 && !p.labels.includes(b.label)) continue;
+          cols.push(`${b.alias}.${p.name} AS ${b.alias}_${p.name}`);
+        }
       }
       if (cols.length > 0) return cols.join(',\n    ');
     }

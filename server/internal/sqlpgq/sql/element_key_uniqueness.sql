@@ -35,11 +35,13 @@ SELECT
           AND (
               -- Compare only the KEY columns. A covering UNIQUE ... INCLUDE (...)
               -- index lists the INCLUDE attnums in indkey too, but they do NOT
-              -- participate in uniqueness, so slice indkey to its first
-              -- indnkeyatts entries before set-comparing against pgekey.
+              -- participate in uniqueness, so keep only the first indnkeyatts
+              -- entries. indkey is an int2vector that casts to a 0-based int2[],
+              -- so we select the first N by ORDINALITY rather than slicing
+              -- [1:N] (which is off by one and would drop the first key column).
               SELECT array_agg(k::int2 ORDER BY k)
-              FROM unnest((ix.indkey::int2[])[1:ix.indnkeyatts]) k
-              WHERE k <> 0
+              FROM unnest(ix.indkey::int2[]) WITH ORDINALITY AS u(k, ord)
+              WHERE u.ord <= ix.indnkeyatts AND k <> 0
           ) = (
               SELECT array_agg(k ORDER BY k)
               FROM unnest(e.pgekey) k
