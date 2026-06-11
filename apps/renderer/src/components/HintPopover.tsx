@@ -1,9 +1,16 @@
-import type { ErrorHint } from '../lib/errors';
+import type { ErrorHint, ErrorHintAction } from '../lib/errors';
 
 interface Props {
   hint: ErrorHint;
   rawError?: string;
   onDismiss?: () => void;
+  /**
+   * Invoked when the user clicks the hint's remediation button. Only rendered
+   * when `hint.action` is set. The parent (Workspace) interprets the action —
+   * e.g. switch to SQL mode and seed the editor — since this leaf component
+   * owns no state and knows nothing about the editor.
+   */
+  onAction?: (a: ErrorHintAction) => void;
 }
 
 /**
@@ -12,7 +19,7 @@ interface Props {
  * (typically by feeding the latest error string through matchHint() and
  * mounting this when the result is non-null).
  */
-export function HintPopover({ hint, rawError, onDismiss }: Props) {
+export function HintPopover({ hint, rawError, onDismiss, onAction }: Props) {
   return (
     <div
       role="status"
@@ -28,15 +35,28 @@ export function HintPopover({ hint, rawError, onDismiss }: Props) {
         <div className="min-w-0 flex-1">
           <div className="text-sm font-medium text-fg">{hint.title}</div>
           <p className="mt-1 text-xs leading-relaxed text-fg-muted">{hint.hint}</p>
-          {hint.docsHref && (
-            <a
-              href={hint.docsHref}
-              target="_blank"
-              rel="noreferrer"
-              className="mt-1.5 inline-block text-[11px] font-medium text-accent hover:underline"
-            >
-              Open PG docs
-            </a>
+          {(hint.action || hint.docsHref) && (
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              {hint.action && onAction && (
+                <button
+                  type="button"
+                  onClick={() => onAction(hint.action!)}
+                  className="rounded border border-accent/50 bg-accent/10 px-2 py-1 text-[11px] font-medium text-accent hover:bg-accent/20"
+                >
+                  {hint.action.label}
+                </button>
+              )}
+              {hint.docsHref && (
+                <a
+                  href={hint.docsHref}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-[11px] font-medium text-accent hover:underline"
+                >
+                  Open PG docs
+                </a>
+              )}
+            </div>
           )}
           {rawError && (
             <details className="mt-2 text-[11px] text-fg-subtle">

@@ -38,9 +38,25 @@ type queryRequest struct {
 	// From items are raw SQL fragments — caller-supplied, caller-trusted.
 	From         []string `json:"from,omitempty"`
 	LateralAlias string   `json:"lateral_alias,omitempty"`
+	// Columns is a graph-mode-only custom COLUMNS list. When non-empty the
+	// projection emits these expressions VERBATIM in place of the synthesized
+	// vertex/edge columns, and the result streams through the columns/rows
+	// path (like SQL mode) instead of producing graph events. Each entry is a
+	// raw SQL fragment — caller-supplied, caller-trusted, exactly like Where
+	// and From. Empty preserves auto-projection (vertex/edge events).
+	Columns []string `json:"columns,omitempty"`
 	// Params is the positional bind list for parameterised SQL ($1, $2, ...).
-	// Only honoured in mode "sql"; graph-mode auto-projection ignores params.
+	// Honoured in both "sql" mode and "graph" mode (the projected GRAPH_TABLE
+	// SELECT forwards them to PostgreSQL).
 	Params []any `json:"params,omitempty"`
+	// Explain / ExplainAnalyze request a query plan instead of results. When
+	// either is set the statement is wrapped in EXPLAIN (FORMAT JSON [, ANALYZE])
+	// and a single {"type":"explain","plan": <json>} event is emitted in place
+	// of the normal columns/rows or vertex/edge stream. ExplainAnalyze implies
+	// EXPLAIN and additionally executes the statement (side effects included),
+	// so it is only meaningful for read-only queries here.
+	Explain        bool `json:"explain,omitempty"`
+	ExplainAnalyze bool `json:"explain_analyze,omitempty"`
 	// ElementCap is a graph-mode-only post-dedup safety net. We stop
 	// emitting vertex/edge events once `unique_vertices + unique_edges`
 	// reaches this value, regardless of how many rows the underlying
@@ -81,6 +97,16 @@ func newQueryID() string {
 //	{"type":"row",     "row":[v1, v2, ...]}            (one per result row)
 //	{"type":"stats",   "rows":N, "command":"SELECT", "db_rows":N}
 //	{"type":"summary", "elapsed_ms":N}
+//
+// Graph mode (auto-projection) instead emits {"type":"vertex"...} /
+// {"type":"edge"...} events. Graph mode with a custom COLUMNS list
+// (req.Columns) streams the columns/rows path above, like SQL mode.
+//
+// EXPLAIN: when req.Explain or req.ExplainAnalyze is set (either mode), the
+// statement is wrapped in EXPLAIN (FORMAT JSON [, ANALYZE]) and a single
+// event is emitted in place of the data stream:
+//
+//	{"type":"explain", "plan": <decoded json plan>}
 //
 // Errors discovered after streaming begins are reported in-band:
 //
@@ -145,6 +171,8 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request) {
 	enc.SetEscapeHTML(false)
 	start := time.Now()
 
+	explain := req.Explain || req.ExplainAnalyze
+
 	var streamErr error
 	rowCount := 0
 	switch req.Mode {
@@ -158,25 +186,50 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request) {
 			"backend_pid": pid,
 		})
 		flusher.Flush()
-		streamErr = streamSQL(r.Context(), conn, req.SQL, req.Params, enc, flusher, &rowCount)
+		if explain {
+			streamErr = streamExplain(r.Context(), conn, req.SQL, req.Params, req.ExplainAnalyze, enc, flusher)
+		} else {
+			streamErr = streamSQL(r.Context(), conn, req.SQL, req.Params, enc, flusher, &rowCount)
+		}
 	case "graph":
 		// Emit a one-line meta event so the client can render binding shapes
 		// (which fields are vertices vs edges, label sets, etc.) before any
-		// data arrives.
+		// data arrives. For a custom-COLUMNS (tabular) query there is no
+		// binding decoder, so the bindings field is omitted.
 		elementCap := req.ElementCap
 		if elementCap <= 0 {
 			elementCap = defaultElementCap
 		}
-		_ = enc.Encode(map[string]any{
+		meta := map[string]any{
 			"type":        "meta",
 			"qid":         qid,
 			"backend_pid": pid,
 			"sql":         projected.SQL,
-			"bindings":    projected.Decoder.BindingViews(),
 			"element_cap": elementCap,
-		})
+		}
+		if projected.Decoder != nil {
+			meta["bindings"] = projected.Decoder.BindingViews()
+		}
+		if projected.Tabular {
+			meta["tabular"] = true
+		}
+		if len(projected.ColumnMap) > 0 {
+			meta["column_map"] = projected.ColumnMap
+		}
+		if len(projected.Trimmed) > 0 {
+			meta["trimmed"] = projected.Trimmed
+		}
+		_ = enc.Encode(meta)
 		flusher.Flush()
-		streamErr = streamGraph(r.Context(), conn, projected, enc, flusher, &rowCount, elementCap)
+		switch {
+		case explain:
+			streamErr = streamExplain(r.Context(), conn, projected.SQL, projected.Params, req.ExplainAnalyze, enc, flusher)
+		case projected.Tabular:
+			// Custom COLUMNS: no graph events to decode, stream raw rows.
+			streamErr = streamSQL(r.Context(), conn, projected.SQL, projected.Params, enc, flusher, &rowCount)
+		default:
+			streamErr = streamGraph(r.Context(), conn, projected, enc, flusher, &rowCount, elementCap)
+		}
 	}
 
 	elapsed := time.Since(start).Milliseconds()
@@ -213,6 +266,14 @@ func validateQueryRequest(req queryRequest) error {
 		if len(req.Bindings) == 0 {
 			return errors.New("bindings is required")
 		}
+		// Custom COLUMNS entries are caller-trusted raw SQL fragments, but
+		// each must be a non-empty string — an empty fragment yields invalid
+		// SQL (a bare comma in the COLUMNS list).
+		for i, c := range req.Columns {
+			if strings.TrimSpace(c) == "" {
+				return fmt.Errorf("columns[%d] must not be empty", i)
+			}
+		}
 	default:
 		return errors.New("mode must be 'sql' or 'graph'")
 	}
@@ -237,20 +298,20 @@ func prepareProjection(
 		}
 		return nil, false
 	}
-	var projected *sqlpgq.ProjectedQuery
-	if len(req.From) > 0 {
-		projected, err = sqlpgq.BuildProjectionWithOpts(sqlpgq.ProjectionOpts{
-			Metadata:     md,
-			Bindings:     req.Bindings,
-			Match:        req.Match,
-			Where:        req.Where,
-			Limit:        req.Limit,
-			LateralFrom:  req.From,
-			LateralAlias: req.LateralAlias,
-		})
-	} else {
-		projected, err = sqlpgq.BuildProjection(md, req.Bindings, req.Match, req.Where, req.Limit)
-	}
+	// Always go through the struct entry point so custom Columns, Params, and
+	// the lateral From form are all honoured. With none of those set the
+	// result is identical to the original BuildProjection path.
+	projected, err := sqlpgq.BuildProjectionWithOpts(sqlpgq.ProjectionOpts{
+		Metadata:     md,
+		Bindings:     req.Bindings,
+		Match:        req.Match,
+		Where:        req.Where,
+		Limit:        req.Limit,
+		LateralFrom:  req.From,
+		LateralAlias: req.LateralAlias,
+		Columns:      req.Columns,
+		Params:       req.Params,
+	})
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return nil, false
@@ -263,6 +324,23 @@ func prepareProjection(
 // row loop in this package.
 const flushEvery = 64
 
+// streamGraph guards (todo.md #6). These sit alongside the post-dedup element
+// cap to bound work the element cap can't see:
+//
+//   - defaultScannedRowCap bounds raw rows scanned. A hub-dense fan-out can
+//     dedup thousands of rows down to a handful of unique elements, so the
+//     element cap never trips while the DB keeps streaming. This caps that.
+//   - defaultGraphWallClock bounds wall-clock time spent in the row loop, so
+//     a pathological plan can't hold the connection (and the client) forever.
+//
+// Row-level LIMIT (req.Limit) still applies in SQL and is the primary control;
+// these are last-resort server-side stops. The stats event carries a
+// `truncated_reason` naming which guard fired.
+const (
+	defaultScannedRowCap  = 200_000
+	defaultGraphWallClock = 30 * time.Second
+)
+
 // streamGraph runs the projected GRAPH_TABLE query and emits one
 // vertex/edge event per binding per row. Deduplication is the client's
 // responsibility — but we apply a post-dedup element cap server-side
@@ -271,7 +349,9 @@ const flushEvery = 64
 // unique edges reaches the cap we stop emitting and finish the stream
 // with `truncated: true` in the stats event.
 func streamGraph(ctx context.Context, pool poolQuerier, pq *sqlpgq.ProjectedQuery, enc *json.Encoder, flusher http.Flusher, out *int, elementCap int) error {
-	rows, err := pool.Query(ctx, pq.SQL)
+	// Forward the projection's bind parameters ($1, $2, ...). nil for a
+	// literal statement, which is the common case.
+	rows, err := pool.Query(ctx, pq.SQL, pq.Params...)
 	if err != nil {
 		return fmt.Errorf("query: %w", err)
 	}
@@ -283,10 +363,22 @@ func streamGraph(ctx context.Context, pool poolQuerier, pq *sqlpgq.ProjectedQuer
 	seenV := make(map[string]struct{})
 	seenE := make(map[string]struct{})
 	truncated := false
+	// truncReason names which guard stopped the stream: "element_cap",
+	// "scanned_rows", or "wall_clock". Empty when we ran to completion.
+	truncReason := ""
+	deadline := time.Now().Add(defaultGraphWallClock)
 
 	for rows.Next() {
 		if elementCap > 0 && len(seenV)+len(seenE) >= elementCap {
-			truncated = true
+			truncated, truncReason = true, "element_cap"
+			break
+		}
+		if rowCount >= defaultScannedRowCap {
+			truncated, truncReason = true, "scanned_rows"
+			break
+		}
+		if time.Now().After(deadline) {
+			truncated, truncReason = true, "wall_clock"
 			break
 		}
 		vals, err := rows.Values()
@@ -316,7 +408,7 @@ func streamGraph(ctx context.Context, pool poolQuerier, pq *sqlpgq.ProjectedQuer
 				return fmt.Errorf("encode event: %w", err)
 			}
 			if elementCap > 0 && len(seenV)+len(seenE) >= elementCap {
-				truncated = true
+				truncated, truncReason = true, "element_cap"
 				break
 			}
 		}
@@ -334,13 +426,62 @@ func streamGraph(ctx context.Context, pool poolQuerier, pq *sqlpgq.ProjectedQuer
 		}
 	}
 	*out = rowCount
-	return enc.Encode(map[string]any{
+	stats := map[string]any{
 		"type":      "stats",
 		"rows":      rowCount,
 		"vertices":  vertexCount,
 		"edges":     edgeCount,
 		"truncated": truncated,
-	})
+	}
+	if truncReason != "" {
+		stats["truncated_reason"] = truncReason
+	}
+	return enc.Encode(stats)
+}
+
+// streamExplain runs a statement under EXPLAIN (FORMAT JSON [, ANALYZE]) and
+// emits a single {"type":"explain","plan": <plan>} NDJSON event. The plan
+// comes back as a single json/jsonb column whose value pgx hands us as
+// already-decoded Go data (map/slice/scalar via encoding/json), so we forward
+// it verbatim. analyze=true adds ANALYZE, which executes the statement — only
+// safe for read-only queries, which is all the viewer issues.
+//
+// The statement runs on the caller's pinned connection (same as streamSQL /
+// streamGraph), so /queries/{qid}/cancel can still cancel it.
+func streamExplain(ctx context.Context, pool poolQuerier, sql string, params []any, analyze bool, enc *json.Encoder, flusher http.Flusher) error {
+	var sb strings.Builder
+	sb.WriteString("EXPLAIN (FORMAT JSON")
+	if analyze {
+		sb.WriteString(", ANALYZE")
+	}
+	sb.WriteString(") ")
+	sb.WriteString(sql)
+
+	rows, err := pool.Query(ctx, sb.String(), params...)
+	if err != nil {
+		return fmt.Errorf("explain: %w", err)
+	}
+	defer rows.Close()
+
+	var plan any
+	if rows.Next() {
+		vals, err := rows.Values()
+		if err != nil {
+			return fmt.Errorf("scan explain row: %w", err)
+		}
+		if len(vals) > 0 {
+			plan = vals[0]
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if err := enc.Encode(map[string]any{"type": "explain", "plan": plan}); err != nil {
+		return fmt.Errorf("encode explain: %w", err)
+	}
+	flusher.Flush()
+	return nil
 }
 
 // streamSQL runs one statement and writes columns, rows, and a stats event.

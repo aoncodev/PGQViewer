@@ -7,6 +7,7 @@
 import { expect, test } from 'vitest';
 
 import { inferBindings } from './matchBindings.ts';
+import { matchHint } from './errors.ts';
 import type { GraphMetadata } from './api.ts';
 
 const meta: GraphMetadata = {
@@ -100,6 +101,16 @@ test('label disjunctions are rejected with an actionable message', () => {
     r.error?.includes('disjunctions'),
     `expected disjunction error, got: ${r.error}`,
   ).toBe(true);
+});
+
+test('the disjunction rejection feeds matchHint and offers a remediation action', () => {
+  // The rejection string must stay matchable by lib/errors.ts so the UI can
+  // surface a one-click action instead of just printing the raw message.
+  const r = inferBindings('(a IS person|movie)-[k IS knows]->(b)', meta);
+  expect(r.error).toBeDefined();
+  const hint = matchHint(r.error!);
+  expect(hint?.title).toBe('Label disjunction not supported in graph mode');
+  expect(hint?.action?.kind).toBe('wrap-graph-table');
 });
 
 test('unlabeled vertex alias binds when metadata is unambiguous', () => {

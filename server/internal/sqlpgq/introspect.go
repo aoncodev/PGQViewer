@@ -53,6 +53,9 @@ var qElementProperties string
 //go:embed sql/element_key_uniqueness.sql
 var qElementKeyUniqueness string
 
+//go:embed sql/element_endpoint_types.sql
+var qElementEndpointTypes string
+
 // ErrNotFound is returned when a graph oid does not exist or is not a
 // property graph.
 var ErrNotFound = errors.New("graph not found")
@@ -100,6 +103,12 @@ func GetMetadata(ctx context.Context, db Queryer, oid uint32) (*GraphMetadata, e
 	if err := attachKeyUniqueness(ctx, db, oid, byOID); err != nil {
 		return nil, err
 	}
+	if err := attachEndpointTypeDiagnostics(ctx, db, oid, byOID); err != nil {
+		return nil, err
+	}
+	// Expression-backed key columns: must run after properties are attached
+	// (it inspects Property.Expression) and after endpoints are populated.
+	attachExpressionKeyDiagnostics(byOID)
 
 	// Resolve edge endpoints to their vertex alias now that we have the map,
 	// and verify that the edge's REFERENCES columns match the referenced
@@ -223,6 +232,157 @@ func attachKeyUniqueness(ctx context.Context, db rowQuerier, graphOID uint32, by
 		})
 	}
 	return rows.Err()
+}
+
+// attachEndpointTypeDiagnostics flags edges whose SOURCE/DESTINATION KEY
+// columns are not type-compatible with the referenced vertex columns.
+//
+// PG19 records the per-column equality operator for explicit REFERENCES but
+// does not require the FK column type to match the referenced column type. A
+// type pair with no binary `=` operator (left=key, right=ref) means the
+// generated GRAPH_TABLE join predicate is unresolvable — the query errors at
+// run time, or (with an implicit cast that loses precision) matches the wrong
+// rows. We surface an error-severity diagnostic at metadata-load time so the
+// user sees it before issuing a query, mirroring the ref-not-vertex-key one.
+//
+// See element_endpoint_types.sql for the catalog comparison.
+func attachEndpointTypeDiagnostics(ctx context.Context, db rowQuerier, graphOID uint32, byOID map[uint32]*Element) error {
+	rows, err := db.Query(ctx, qElementEndpointTypes, graphOID)
+	if err != nil {
+		return fmt.Errorf("element endpoint types: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			elOID    uint32
+			side     string
+			ord      int
+			keyCol   string
+			keyTypid uint32
+			refCol   string
+			refTypid uint32
+			keyTyp   string
+			refTyp   string
+			hasEqOp  bool
+		)
+		if err := rows.Scan(
+			&elOID, &side, &ord,
+			&keyCol, &keyTypid, &refCol, &refTypid,
+			&keyTyp, &refTyp, &hasEqOp,
+		); err != nil {
+			return fmt.Errorf("scan endpoint type: %w", err)
+		}
+		// A resolvable equality operator means the join works — no diagnostic.
+		// Identical type oids always have one; we still trust has_eq_op so that
+		// cross-type but operator-backed pairs (e.g. int4 = int8) pass.
+		if hasEqOp {
+			continue
+		}
+		e, ok := byOID[elOID]
+		if !ok {
+			continue
+		}
+		e.Diagnostics = append(e.Diagnostics, endpointTypeDiagnostic(
+			side, e.Alias, keyCol, keyTyp, refCol, refTyp,
+		))
+	}
+	return rows.Err()
+}
+
+// endpointTypeDiagnostic builds the user-facing error for an edge endpoint
+// whose KEY column type cannot be equated with the referenced vertex column
+// type.
+func endpointTypeDiagnostic(side, edgeAlias, keyCol, keyTyp, refCol, refTyp string) Diagnostic {
+	return Diagnostic{
+		Code:     "endpoint-key-type-mismatch",
+		Severity: "error",
+		Field:    side,
+		Message: fmt.Sprintf(
+			"edge %q's %s KEY column %q (%s) has no equality operator with the referenced vertex column %q (%s); GRAPH_TABLE joins on this endpoint will fail or match nothing. Align the column types (e.g. recreate the FK column as %s) or change the referenced KEY.",
+			edgeAlias, side, keyCol, keyTyp, refCol, refTyp, refTyp,
+		),
+	}
+}
+
+// attachExpressionKeyDiagnostics flags elements whose KEY / SOURCE KEY /
+// DESTINATION KEY columns are surfaced only through an expression property
+// (Property.Expression set to something other than a plain column) rather than
+// a plain scalar column.
+//
+// Identity synthesis (the synthetic `<elemOID>:<pk>` ids and edge endpoint
+// linking) reads these columns as stable scalar values. When the catalog
+// exposes a key column only via a computed expression, the projected value can
+// drift from the underlying FK/PK value used elsewhere, producing nodes/edges
+// that don't dedup or link correctly. PG19 permits this; we warn so the user
+// understands a possibly-wrong canvas.
+//
+// This is a heuristic that flags only the case where NO plain-column property
+// backs the key column but an expression property does. A key column with a
+// plain backing property (the common case) produces no diagnostic.
+func attachExpressionKeyDiagnostics(byOID map[uint32]*Element) {
+	for _, e := range byOID {
+		seen := map[string]bool{}
+		flag := func(role string, cols []string) {
+			for _, c := range cols {
+				if seen[role+"\x00"+c] {
+					continue
+				}
+				if exprProp, ok := expressionBackedKeyColumn(e, c); ok {
+					seen[role+"\x00"+c] = true
+					e.Diagnostics = append(e.Diagnostics, expressionKeyDiagnostic(e.Alias, role, c, exprProp))
+				}
+			}
+		}
+		flag("KEY", e.PK)
+		if e.Source != nil {
+			flag("source KEY", e.Source.Key)
+		}
+		if e.Destination != nil {
+			flag("destination KEY", e.Destination.Key)
+		}
+	}
+}
+
+// expressionBackedKeyColumn reports whether the given underlying column is
+// surfaced ONLY by an expression property (no plain-column property and no
+// simple-column-alias property matches it), and if so returns the offending
+// property name. The matching mirrors projection.go's propertyForColumn so the
+// two stay consistent about what counts as a "plain" column.
+func expressionBackedKeyColumn(el *Element, col string) (string, bool) {
+	// A plain property whose name equals the column: safe.
+	for _, p := range el.Properties {
+		if p.Name == col {
+			return "", false
+		}
+	}
+	// A property aliasing a simple column expression to this column: safe.
+	for _, p := range el.Properties {
+		if p.Expression != nil && simpleColumnExprMatches(*p.Expression, col) {
+			return "", false
+		}
+	}
+	// No plain backing. If a NON-simple expression property exists at all, the
+	// key column is reachable only through computed expressions — flag the
+	// first one as the likely culprit.
+	for _, p := range el.Properties {
+		if p.Expression != nil && !simpleColumnExprMatches(*p.Expression, col) {
+			return p.Name, true
+		}
+	}
+	return "", false
+}
+
+// expressionKeyDiagnostic builds the warning for an expression-backed key
+// column.
+func expressionKeyDiagnostic(alias, role, col, exprProp string) Diagnostic {
+	return Diagnostic{
+		Code:     "expression-backed-key",
+		Severity: "warning",
+		Message: fmt.Sprintf(
+			"element %q's %s column %q is exposed only through expression property %q, not a plain column; identity synthesis assumes a stable scalar column, so nodes/edges may fail to dedup or link. Declare %q as a plain property (PROPERTIES ALL COLUMNS or %s AS %s).",
+			alias, role, col, exprProp, col, col, col,
+		),
+	}
 }
 
 // GetCounts returns the planner's row estimate (`pg_class.reltuples`)

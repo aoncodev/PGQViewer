@@ -11,10 +11,22 @@
 // Substrings are chosen to survive interpolation (e.g. "property X does
 // not exist" -> we match the fixed bit "does not exist").
 
+// A UI action a hint can offer. The renderer (HintPopover) renders a button
+// when `action` is set and calls back into the workspace, which knows how to
+// switch modes / seed the SQL editor. Kept declarative (kind + label +
+// optional payload) so the leaf component stays state-free.
+export type ErrorHintAction = {
+  kind: 'switch-to-sql' | 'wrap-graph-table';
+  label: string;
+  payload?: string;
+};
+
 export interface ErrorHint {
   title: string;
   hint: string;
   docsHref?: string;
+  /** Optional one-click remediation the UI can offer alongside the prose. */
+  action?: ErrorHintAction;
 }
 
 interface Pattern {
@@ -23,10 +35,39 @@ interface Pattern {
   hint: ErrorHint;
 }
 
-const DOCS_QUERIES = 'https://www.postgresql.org/docs/devel/queries-graph.html';
-const DOCS_DDL = 'https://www.postgresql.org/docs/devel/ddl-property-graphs.html';
-const DOCS_CREATE = 'https://www.postgresql.org/docs/devel/sql-create-property-graph.html';
-const DOCS_ALTER = 'https://www.postgresql.org/docs/devel/sql-alter-property-graph.html';
+// The PG release the verbatim needles below were captured against. A test
+// asserts on this so a careless docs/version bump can't silently desync the
+// characterization fixtures from the wording they were pinned to.
+export const VERIFIED_AGAINST = '19beta1';
+
+// Single source of truth for the docs version path segment. PG renames the
+// `/devel/` path to `/19/` once 19 ships GA; centralizing it here means one
+// edit flips every hint's docs link.
+const DOCS_BASE = 'https://www.postgresql.org/docs/devel';
+const DOCS_QUERIES = `${DOCS_BASE}/queries-graph.html`;
+const DOCS_DDL = `${DOCS_BASE}/ddl-property-graphs.html`;
+const DOCS_CREATE = `${DOCS_BASE}/sql-create-property-graph.html`;
+const DOCS_ALTER = `${DOCS_BASE}/sql-alter-property-graph.html`;
+
+// Reused remediation actions. `switch-to-sql` flips the editor to SQL mode
+// (Workspace seeds sqlText); `wrap-graph-table` does the same but signals the
+// intent was specifically "wrap this MATCH in a hand-written GRAPH_TABLE".
+const ACTION_RECURSIVE_CTE: ErrorHintAction = {
+  kind: 'switch-to-sql',
+  label: 'Rewrite as recursive CTE in SQL mode',
+};
+const ACTION_SPLIT_IN_SQL: ErrorHintAction = {
+  kind: 'switch-to-sql',
+  label: 'Split paths in SQL mode',
+};
+const ACTION_WRAP_GRAPH_TABLE: ErrorHintAction = {
+  kind: 'wrap-graph-table',
+  label: 'Open as GRAPH_TABLE in SQL mode',
+};
+const ACTION_MOVE_TO_WHERE: ErrorHintAction = {
+  kind: 'switch-to-sql',
+  label: 'Edit the full query in SQL mode',
+};
 
 // The COLUMNS-star hint is shared by two triggers: the rewriter's friendly
 // `"*" is not supported here` (fires for a qualified `a.*`) and the
@@ -45,8 +86,9 @@ const PATTERNS: Pattern[] = [
     needles: ['element pattern quantifier is not supported'],
     hint: {
       title: 'Path quantifiers are not in PG19',
-      hint: 'PG19 does not support {m,n}, * or + quantifiers on element patterns. Use Path Finder to generate a recursive CTE over the underlying tables, or write the join manually.',
+      hint: 'PG19 does not support {m,n}, * or + quantifiers on element patterns. Switch to SQL mode and write a recursive CTE over the underlying tables (a WITH RECURSIVE walk of the edge table), or expand the pattern to a fixed number of hops.',
       docsHref: DOCS_QUERIES,
+      action: ACTION_RECURSIVE_CTE,
     },
   },
   {
@@ -55,6 +97,7 @@ const PATTERNS: Pattern[] = [
       title: 'One path per GRAPH_TABLE',
       hint: 'PG19 rejects multiple comma-separated paths inside a single GRAPH_TABLE. Split each path into its own GRAPH_TABLE call and join them in SQL.',
       docsHref: DOCS_QUERIES,
+      action: ACTION_SPLIT_IN_SQL,
     },
   },
   {
@@ -94,9 +137,10 @@ const PATTERNS: Pattern[] = [
   {
     needles: ['non-local element variable reference is not supported'],
     hint: {
-      title: 'Cannot reference outer aliases here',
-      hint: 'PG19 forbids referencing outer aliases inside an element WHERE clause. To correlate with outer rows, move the GRAPH_TABLE call to a LATERAL position — toggle "Lateral join" on the editor and add the outer FROM items there.',
+      title: 'Cross-element refs only in top-level WHERE',
+      hint: 'PG19 forbids referencing another element\'s variable inside an element\'s own WHERE (an element WHERE may only mention its own variable). Move the predicate to a top-level WHERE after the pattern, where cross-element predicates like `a.x OR b.y` are allowed — or edit the full query in SQL mode.',
       docsHref: DOCS_QUERIES,
+      action: ACTION_MOVE_TO_WHERE,
     },
   },
   {
@@ -132,11 +176,26 @@ const PATTERNS: Pattern[] = [
     },
   },
   {
+    // 19beta1 rejects nested element patterns — `((a)->(b))` — with the
+    // verbatim `unsupported element pattern kind: "nested path pattern"`.
     needles: ['unsupported element pattern kind'],
     hint: {
       title: 'Unsupported element pattern',
-      hint: 'PG19 only supports vertex patterns in parentheses and edge patterns in brackets. Remove any other syntax — quantifiers, group variables, and path modes are not recognised.',
+      hint: 'PG19 only supports vertex patterns in parentheses and edge patterns in brackets — nested ((a)->(b)) sub-patterns are not allowed. Flatten the pattern to a single path, or edit it in SQL mode.',
       docsHref: DOCS_QUERIES,
+      action: ACTION_MOVE_TO_WHERE,
+    },
+  },
+  {
+    // `subqueries within GRAPH_TABLE reference are not supported` — a
+    // SELECT inside a COLUMNS expr or element WHERE. Hand-write the query
+    // in SQL mode where subqueries are legal.
+    needles: ['subqueries within graph_table reference are not supported'],
+    hint: {
+      title: 'No subqueries inside GRAPH_TABLE',
+      hint: 'PG19 does not allow subqueries inside a GRAPH_TABLE reference (neither in COLUMNS nor in an element WHERE). Move the subquery outside the GRAPH_TABLE — wrap the GRAPH_TABLE in an outer SELECT — by editing the query in SQL mode.',
+      docsHref: DOCS_QUERIES,
+      action: ACTION_WRAP_GRAPH_TABLE,
     },
   },
   {
@@ -204,6 +263,48 @@ const PATTERNS: Pattern[] = [
       title: 'Temp table on a persistent graph',
       hint: 'ALTER PROPERTY GRAPH cannot add a temporary element table to a non-temporary property graph. Use a persistent table, or recreate the graph with the temp table included — CREATE then makes the whole graph temporary.',
       docsHref: DOCS_ALTER,
+    },
+  },
+
+  // ───────── viewer-synthesized errors (not from PG) ─────────
+  // The next two are produced by PGQViewer's own projection/introspection
+  // code (server/internal/sqlpgq/projection.go and introspect.go), not by
+  // PostgreSQL. They surface as ordinary `error` events, so they ride the
+  // same matchHint path; needles below mirror those Go format strings.
+  {
+    // projection.go validateBinding: PK / source / destination key columns
+    // `%v are not declared as properties`. The viewer synthesizes element
+    // identity from those columns, so they must be projectable, and SQL/PGQ
+    // only allows declared properties inside COLUMNS.
+    needles: ['are not declared as properties'],
+    hint: {
+      title: 'Key columns not exposed as properties',
+      hint: 'The viewer builds each element\'s identity from its KEY / endpoint columns, but those columns are not declared as properties so they can\'t be selected inside COLUMNS. Recreate the graph with CREATE PROPERTY GRAPH ... PROPERTIES ALL COLUMNS (or list the key columns in PROPERTIES (...)).',
+      docsHref: DOCS_CREATE,
+    },
+  },
+  {
+    // introspect.go refMismatchDiagnostic: an edge's SOURCE/DESTINATION
+    // `REFERENCES columns (...) do not match vertex "..."'s KEY columns (...)`.
+    // The viewer can't synthesize matching endpoint ids across the mismatch.
+    needles: ['references columns', 'do not match', 'key columns'],
+    hint: {
+      title: 'Edge endpoints do not match vertex key',
+      hint: 'This edge\'s SOURCE/DESTINATION REFERENCES columns don\'t equal the referenced vertex\'s KEY columns, so the viewer can\'t link edges to their endpoints. Recreate the graph so the edge REFERENCES the vertex\'s KEY columns, or change the vertex\'s KEY clause to match.',
+      docsHref: DOCS_CREATE,
+    },
+  },
+  {
+    // matchBindings.ts rejects label disjunctions (`(x IS a|b)`) during
+    // auto-projection — the server can't yet project one alias to multiple
+    // elements. The needle mirrors the inferBindings() message so the UI can
+    // offer a remediation action rather than just printing the string.
+    needles: ['label disjunctions', 'not yet supported in graph mode'],
+    hint: {
+      title: 'Label disjunction not supported in graph mode',
+      hint: 'PG19 accepts `(x IS a|b)`, but the viewer\'s auto-projection can\'t yet map one alias to multiple elements. Pick a single label, or open the query as a hand-written GRAPH_TABLE in SQL mode and choose the COLUMNS yourself.',
+      docsHref: DOCS_QUERIES,
+      action: ACTION_WRAP_GRAPH_TABLE,
     },
   },
 ];

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { matchHint } from './errors';
+import { matchHint, VERIFIED_AGAINST } from './errors';
 
 // Characterization tests for the PG19 error → hint mapping.
 //
@@ -20,6 +20,25 @@ describe('matchHint — verbatim 19beta1 rewriter/parser strings', () => {
       'multiple path patterns in one GRAPH_TABLE clause not supported',
     );
     expect(h?.title).toBe('One path per GRAPH_TABLE');
+  });
+
+  it('non-local element variable reference (cross-element ref in element WHERE)', () => {
+    const h = matchHint('non-local element variable reference is not supported');
+    expect(h?.title).toBe('Cross-element refs only in top-level WHERE');
+  });
+
+  it('unsupported element pattern kind (nested path pattern)', () => {
+    const h = matchHint(
+      'unsupported element pattern kind: "nested path pattern"',
+    );
+    expect(h?.title).toBe('Unsupported element pattern');
+  });
+
+  it('subquery inside GRAPH_TABLE', () => {
+    const h = matchHint(
+      'subqueries within GRAPH_TABLE reference are not supported',
+    );
+    expect(h?.title).toBe('No subqueries inside GRAPH_TABLE');
   });
 
   it('qualified star in COLUMNS (a.*)', () => {
@@ -153,5 +172,79 @@ describe('matchHint — parser-level syntax-error fallbacks', () => {
 
   it('no query text means no fallback', () => {
     expect(matchHint('syntax error at or near "*"')).toBeNull();
+  });
+});
+
+describe('matchHint — viewer-synthesized errors (projection.go / introspect.go)', () => {
+  // Mirrors projection.go validateBinding format strings verbatim.
+  it('PK columns not declared as properties', () => {
+    const h = matchHint(
+      'binding "a" (people): PK columns [id] are not declared as properties — recreate the property graph with PROPERTIES ALL COLUMNS or list them in PROPERTIES (...)',
+    );
+    expect(h?.title).toBe('Key columns not exposed as properties');
+  });
+
+  it('source key columns not declared as properties', () => {
+    const h = matchHint(
+      'binding "k" (knows): source key columns [src] are not declared as properties',
+    );
+    expect(h?.title).toBe('Key columns not exposed as properties');
+  });
+
+  it('destination key columns not declared as properties', () => {
+    const h = matchHint(
+      'binding "k" (knows): destination key columns [dst] are not declared as properties',
+    );
+    expect(h?.title).toBe('Key columns not exposed as properties');
+  });
+
+  // Mirrors introspect.go refMismatchDiagnostic format string verbatim.
+  it('edge REFERENCES columns do not match vertex KEY columns', () => {
+    const h = matchHint(
+      'edge "knows"\'s SOURCE REFERENCES columns (src) do not match vertex "person"\'s KEY columns (id); the viewer cannot synthesize matching endpoint ids. Recreate the graph with REFERENCES person (id) or change vertex "person"\'s KEY clause.',
+    );
+    expect(h?.title).toBe('Edge endpoints do not match vertex key');
+  });
+
+  // Mirrors matchBindings.ts inferBindings disjunction rejection so the UI
+  // can offer a remediation action instead of printing the raw string.
+  it('label disjunction rejection from auto-projection', () => {
+    const h = matchHint(
+      'label disjunctions (`IS a|b`) are not yet supported in graph mode — switch to SQL mode for this query, or pick a single label',
+    );
+    expect(h?.title).toBe('Label disjunction not supported in graph mode');
+  });
+});
+
+describe('matchHint — remediation actions', () => {
+  it('quantifier hint offers a recursive-CTE switch-to-sql action', () => {
+    const h = matchHint('element pattern quantifier is not supported');
+    expect(h?.action?.kind).toBe('switch-to-sql');
+    expect(h?.action?.label).toBe('Rewrite as recursive CTE in SQL mode');
+  });
+
+  it('multiple-path-patterns hint offers a switch-to-sql action', () => {
+    const h = matchHint(
+      'multiple path patterns in one GRAPH_TABLE clause not supported',
+    );
+    expect(h?.action?.kind).toBe('switch-to-sql');
+  });
+
+  it('non-local element variable hint offers a switch-to-sql action', () => {
+    const h = matchHint('non-local element variable reference is not supported');
+    expect(h?.action?.kind).toBe('switch-to-sql');
+  });
+
+  it('label-disjunction hint offers a wrap-graph-table action', () => {
+    const h = matchHint(
+      'label disjunctions (`IS a|b`) are not yet supported in graph mode — switch to SQL mode for this query, or pick a single label',
+    );
+    expect(h?.action?.kind).toBe('wrap-graph-table');
+  });
+});
+
+describe('errors module markers', () => {
+  it('is pinned to the verified PG release', () => {
+    expect(VERIFIED_AGAINST).toBe('19beta1');
   });
 });

@@ -5,6 +5,7 @@ package api
 // decomposition stays behaviour-preserving.
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/aoncodev/PGQViewer/server/internal/sqlpgq"
@@ -59,6 +60,23 @@ func TestValidateQueryRequest(t *testing.T) {
 			req:     queryRequest{},
 			wantErr: "mode must be 'sql' or 'graph'",
 		},
+		{
+			name: "graph custom columns ok",
+			req: queryRequest{
+				Mode: "graph", GraphOID: 42, Match: "(a)",
+				Bindings: []sqlpgq.Binding{{Alias: "a", ElementOID: 1}},
+				Columns:  []string{"a.name AS who"},
+			},
+		},
+		{
+			name: "graph empty column rejected",
+			req: queryRequest{
+				Mode: "graph", GraphOID: 42, Match: "(a)",
+				Bindings: []sqlpgq.Binding{{Alias: "a", ElementOID: 1}},
+				Columns:  []string{"a.name", "  "},
+			},
+			wantErr: "columns[1] must not be empty",
+		},
 	}
 
 	for _, tt := range tests {
@@ -73,5 +91,33 @@ func TestValidateQueryRequest(t *testing.T) {
 				t.Fatalf("error = %q, want %q", err.Error(), tt.wantErr)
 			}
 		})
+	}
+}
+
+// TestQueryRequest_NewFieldsDecode pins the wire names of the new request
+// fields (columns, explain, explain_analyze, params in graph mode).
+func TestQueryRequest_NewFieldsDecode(t *testing.T) {
+	body := `{
+		"mode":"graph",
+		"graph_oid":42,
+		"match":"(a)",
+		"bindings":[{"alias":"a","element_oid":1}],
+		"columns":["a.name AS who","b.born"],
+		"params":[5,"x"],
+		"explain":true,
+		"explain_analyze":false
+	}`
+	var req queryRequest
+	if err := json.Unmarshal([]byte(body), &req); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(req.Columns) != 2 || req.Columns[0] != "a.name AS who" {
+		t.Fatalf("columns decoded wrong: %v", req.Columns)
+	}
+	if len(req.Params) != 2 {
+		t.Fatalf("params decoded wrong: %v", req.Params)
+	}
+	if !req.Explain || req.ExplainAnalyze {
+		t.Fatalf("explain flags decoded wrong: %v / %v", req.Explain, req.ExplainAnalyze)
 	}
 }

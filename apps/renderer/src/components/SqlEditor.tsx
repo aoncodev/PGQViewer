@@ -7,6 +7,8 @@ import { autocompletion, completionKeymap, type CompletionContext, type Completi
 import { syntaxHighlighting, defaultHighlightStyle, indentOnInput, bracketMatching, foldGutter, foldKeymap, HighlightStyle } from '@codemirror/language';
 import { sql, PostgreSQL } from '@codemirror/lang-sql';
 import { tags as t } from '@lezer/highlight';
+import type { Element, GraphMetadata } from '../lib/api';
+import { inferBindings } from '../lib/matchBindings';
 
 // --- SQL/PGQ keyword tweaks ------------------------------------------------
 
@@ -47,6 +49,186 @@ function pgqCompletions(context: CompletionContext) {
     boost: 50,
   }));
   return { from: word.from, options };
+}
+
+// --- graph-mode schema autocomplete ---------------------------------------
+//
+// When a GraphMetadata is in scope (graph mode), this source layers
+// schema-aware completions on top of the keyword/SQL ones:
+//
+//   (a)  inside `(...)` after `IS `, suggest vertex labels;
+//        inside `[...]` after `IS `, suggest edge labels (kind-aware, the
+//        same vertex/edge distinction matchBindings uses);
+//   (b)  after `<alias>.`, resolve the alias's element via inferBindings()
+//        over the MATCH pattern and suggest that element's property names;
+//   (c)  elsewhere in a WHERE expression, suggest the aliases already
+//        declared in the pattern.
+//
+// The source is built as a closure over a getter so the once-initialized
+// editor can read the latest metadata without re-creating the view.
+
+const uniq = (xs: string[]): string[] => Array.from(new Set(xs));
+
+// Words that follow SQL's `IS` in a null/boolean test rather than a SQL/PGQ
+// label expression. Used to suppress label completion for `x IS NULL` etc. in
+// a hand-written GRAPH_TABLE/SQL query. Matched exactly (not as a prefix) so a
+// graph label that merely starts with one of these letters — e.g. `node` — is
+// still suggested while the user is mid-type.
+const IS_SQL_KEYWORD = /^(NULL|NOT|TRUE|FALSE|UNKNOWN|DISTINCT)$/i;
+
+// Collect every distinct label across the given elements.
+function labelsOf(elements: Element[]): string[] {
+  return uniq(elements.flatMap((e) => e.labels)).sort();
+}
+
+// Find the path pattern inferBindings should parse. Two shapes are supported:
+//
+//   • graph mode: the editor holds the bare pattern, e.g.
+//     `(a IS person)-[k]->(b)` — no MATCH/COLUMNS keywords. We treat the whole
+//     document as the pattern.
+//   • SQL mode: a full `GRAPH_TABLE (g MATCH <pattern> COLUMNS (...))` — we
+//     slice out the substring between MATCH and the COLUMNS keyword.
+//
+// Returning the whole doc in the no-MATCH case is safe: inferBindings is
+// itself string-literal- and bracket-aware and ignores anything that isn't a
+// top-level element pattern.
+function extractMatchPattern(doc: string): string {
+  const m = /\bMATCH\b/i.exec(doc);
+  if (!m) return doc;
+  const rest = doc.slice(m.index + m[0].length);
+  const cols = /\bCOLUMNS\b/i.exec(rest);
+  return (cols ? rest.slice(0, cols.index) : rest).trim();
+}
+
+// Resolve alias → Element using the same inference matchBindings does. We map
+// the inferred element_oid back to the full Element so we can read properties.
+function aliasElementMap(
+  doc: string,
+  meta: GraphMetadata,
+): Map<string, Element> {
+  const out = new Map<string, Element>();
+  const pattern = extractMatchPattern(doc);
+  if (!pattern.trim()) return out;
+  const byOID = new Map<number, Element>();
+  for (const e of [...meta.vertices, ...meta.edges]) byOID.set(e.oid, e);
+  const r = inferBindings(pattern, meta);
+  for (const b of r.bindings) {
+    const el = byOID.get(b.element_oid);
+    if (el) out.set(b.alias, el);
+  }
+  return out;
+}
+
+// Detect whether the cursor sits inside a top-level `(...)` (vertex) or
+// `[...]` (edge) element pattern, scanning backwards from `pos`. String
+// literals are skipped so a `(` inside a WHERE string doesn't fool us. Returns
+// the enclosing bracket kind, or null when at top level.
+function enclosingElementKind(
+  doc: string,
+  pos: number,
+): 'vertex' | 'edge' | null {
+  let inString = false;
+  // Stack of opener chars so nested parens (e.g. a WHERE expr) resolve to the
+  // *innermost* element bracket.
+  const stack: string[] = [];
+  for (let i = 0; i < pos; i++) {
+    const c = doc[i]!;
+    if (inString) {
+      if (c === "'") {
+        if (doc[i + 1] === "'") {
+          i++;
+          continue;
+        }
+        inString = false;
+      }
+      continue;
+    }
+    if (c === "'") {
+      inString = true;
+      continue;
+    }
+    if (c === '(' || c === '[') stack.push(c);
+    else if (c === ')' || c === ']') stack.pop();
+  }
+  for (let i = stack.length - 1; i >= 0; i--) {
+    if (stack[i] === '[') return 'edge';
+    if (stack[i] === '(') return 'vertex';
+  }
+  return null;
+}
+
+function makeGraphCompletions(getMeta: () => GraphMetadata | null) {
+  return function graphCompletions(context: CompletionContext) {
+    const meta = getMeta();
+    if (!meta) return null;
+    const doc = context.state.doc.toString();
+    const pos = context.pos;
+    const before = doc.slice(0, pos);
+
+    // (b) `<alias>.` property completion. Matches the dotted identifier the
+    // user is typing, e.g. `a.na`. Resolve the alias to its element via the
+    // same inference matchBindings uses, then offer property names.
+    const dotted = context.matchBefore(/[A-Za-z_][A-Za-z_0-9]*\.[A-Za-z_0-9]*/);
+    if (dotted) {
+      const [alias] = dotted.text.split('.');
+      const el = aliasElementMap(doc, meta).get(alias!);
+      if (el) {
+        const dotAt = dotted.from + alias!.length + 1;
+        const options: Completion[] = el.properties.map((p) => ({
+          label: p.name,
+          type: 'property',
+          detail: p.type,
+          boost: 70,
+        }));
+        if (options.length > 0) return { from: dotAt, options };
+      }
+      // Unknown alias / no properties — let other sources try.
+      return null;
+    }
+
+    // (a) label completion after `IS `. The IS keyword can be followed by a
+    // partial label the user is typing. We only fire inside an element
+    // bracket so a stray `IS` elsewhere doesn't trigger labels. We also skip
+    // SQL null-test keywords (`IS NULL`, `IS NOT TRUE`, …) so a predicate like
+    // `WHERE (x IS NULL)` in a hand-written GRAPH_TABLE/SQL query doesn't get
+    // label suggestions.
+    const afterIs = /\bIS\s+([A-Za-z_][A-Za-z_0-9]*)?$/i.exec(before);
+    if (afterIs && !IS_SQL_KEYWORD.test(afterIs[1] ?? '')) {
+      const kind = enclosingElementKind(doc, pos);
+      if (kind) {
+        const pool = kind === 'vertex' ? meta.vertices : meta.edges;
+        const labels = labelsOf(pool);
+        const typed = afterIs[1] ?? '';
+        const from = pos - typed.length;
+        const options: Completion[] = labels.map((label) => ({
+          label,
+          type: 'class',
+          detail: kind === 'vertex' ? 'vertex label' : 'edge label',
+          boost: 80,
+        }));
+        if (options.length > 0) return { from, options };
+      }
+    }
+
+    // (c) bare-identifier completion: suggest aliases already declared in the
+    // pattern (useful in a WHERE expression). Only when there's a word to
+    // complete or the user explicitly asked.
+    const word = context.matchBefore(/[A-Za-z_][A-Za-z_0-9]*/);
+    if (word && (word.from !== word.to || context.explicit)) {
+      const aliases = Array.from(aliasElementMap(doc, meta).keys());
+      if (aliases.length > 0) {
+        const options: Completion[] = aliases.map((alias) => ({
+          label: alias,
+          type: 'variable',
+          detail: 'alias',
+          boost: 60,
+        }));
+        return { from: word.from, options };
+      }
+    }
+
+    return null;
+  };
 }
 
 // --- theme ----------------------------------------------------------------
@@ -115,6 +297,13 @@ interface SqlEditorProps {
    * column names. Used by lang-sql's built-in completion.
    */
   schema?: Record<string, string[]>;
+  /**
+   * Graph-mode metadata. When present (graph mode), enables schema-aware
+   * autocomplete: label suggestions after `IS` inside `(...)` / `[...]`,
+   * `<alias>.property` suggestions, and declared-alias suggestions in WHERE.
+   * Null/undefined (SQL mode) leaves the editor's SQL completion unchanged.
+   */
+  graphMeta?: GraphMetadata | null;
   className?: string;
   minHeight?: string;
   /**
@@ -133,6 +322,7 @@ export function SqlEditor({
   onHistoryNext,
   placeholder,
   schema,
+  graphMeta,
   className,
   minHeight = '120px',
   heightPx,
@@ -144,12 +334,17 @@ export function SqlEditor({
   const onChangeRef = useRef(onChange);
   const onHistoryPrevRef = useRef(onHistoryPrev);
   const onHistoryNextRef = useRef(onHistoryNext);
+  // Latest graph metadata, read by the graph completion source. Held in a ref
+  // so the editor (initialized once) always sees current metadata without a
+  // reconfigure on every metadata change.
+  const graphMetaRef = useRef<GraphMetadata | null>(graphMeta ?? null);
 
   useEffect(() => {
     onSubmitRef.current = onSubmit;
     onChangeRef.current = onChange;
     onHistoryPrevRef.current = onHistoryPrev;
     onHistoryNextRef.current = onHistoryNext;
+    graphMetaRef.current = graphMeta ?? null;
   });
 
   // Initialize once.
@@ -174,7 +369,9 @@ export function SqlEditor({
         rectangularSelection(),
         crosshairCursor(),
         highlightActiveLine(),
-        autocompletion({ override: [pgqCompletions] }),
+        autocompletion({
+          override: [makeGraphCompletions(() => graphMetaRef.current), pgqCompletions],
+        }),
         langCompRef.current.of(sql({ dialect: PostgreSQL, schema })),
         keymap.of([
           {

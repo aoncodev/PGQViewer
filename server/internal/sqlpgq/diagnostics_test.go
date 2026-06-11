@@ -17,9 +17,11 @@ import (
 const diagnosticsFixtureSQL = `
 DROP PROPERTY GRAPH IF EXISTS bugtest_nonunique_g;
 DROP PROPERTY GRAPH IF EXISTS bugtest_refmismatch_g;
+DROP PROPERTY GRAPH IF EXISTS bugtest_exprkey_g;
 DROP TABLE IF EXISTS bugtest_nonunique_v;
 DROP TABLE IF EXISTS bugtest_refmismatch_edge;
 DROP TABLE IF EXISTS bugtest_refmismatch_vertex;
+DROP TABLE IF EXISTS bugtest_exprkey_v;
 
 -- Bug #0: KEY column with no unique index. PG19 accepts this without
 -- diagnostic, and the viewer must surface a non-unique-key warning.
@@ -56,6 +58,52 @@ CREATE PROPERTY GRAPH bugtest_refmismatch_g
             SOURCE      KEY (src_email) REFERENCES bugtest_refmismatch_vertex (email)
             DESTINATION KEY (dst_email) REFERENCES bugtest_refmismatch_vertex (email)
             LABEL bugtest_knows PROPERTIES ALL COLUMNS
+    );
+
+-- Bug #4: a KEY column exposed ONLY through an expression property, not a
+-- plain column. PG19 accepts KEY (id) while PROPERTIES projects only the
+-- computed (id * 2). Identity synthesis assumes a stable scalar column, so the
+-- viewer must surface an expression-backed-key warning.
+CREATE TABLE bugtest_exprkey_v (
+    id int PRIMARY KEY,
+    n  text
+);
+CREATE PROPERTY GRAPH bugtest_exprkey_g
+    VERTEX TABLES (
+        bugtest_exprkey_v KEY (id)
+            LABEL bugtest_ek PROPERTIES (id * 2 AS scaled, n AS n)
+    );
+`
+
+// typeMismatchFixtureSQL is created separately and tolerantly: depending on the
+// exact PG19 beta, CREATE PROPERTY GRAPH may itself reject an endpoint whose
+// KEY/REFERENCES column types have no equality operator (it must pick one when
+// recording pgesrceqop). When the DDL is accepted, TestGetMetadata_FlagsEndpointTypeMismatch
+// asserts the diagnostic; when PG19 refuses the DDL, the test skips rather than
+// failing, so the suite stays honest across beta releases.
+const typeMismatchFixtureSQL = `
+DROP PROPERTY GRAPH IF EXISTS bugtest_typemismatch_g;
+DROP TABLE IF EXISTS bugtest_typemismatch_edge;
+DROP TABLE IF EXISTS bugtest_typemismatch_vertex;
+
+CREATE TABLE bugtest_typemismatch_vertex (
+    id uuid PRIMARY KEY
+);
+CREATE TABLE bugtest_typemismatch_edge (
+    eid int PRIMARY KEY,
+    src int NOT NULL,
+    dst int NOT NULL
+);
+CREATE PROPERTY GRAPH bugtest_typemismatch_g
+    VERTEX TABLES (
+        bugtest_typemismatch_vertex KEY (id)
+            LABEL bugtest_tm_v PROPERTIES ALL COLUMNS
+    )
+    EDGE TABLES (
+        bugtest_typemismatch_edge KEY (eid)
+            SOURCE      KEY (src) REFERENCES bugtest_typemismatch_vertex (id)
+            DESTINATION KEY (dst) REFERENCES bugtest_typemismatch_vertex (id)
+            LABEL bugtest_tm_e PROPERTIES ALL COLUMNS
     );
 `
 
@@ -199,6 +247,88 @@ func TestBuildProjection_AllowsNonUniqueKeyWarning(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("BuildProjection should allow non-unique-key warning, got: %v", err)
+	}
+}
+
+// setupTypeMismatchFixture runs the endpoint-type-mismatch DDL, tolerating a
+// rejection by PG19 (some betas refuse to record an equality operator for an
+// incompatible REFERENCES). Returns true when the property graph was created.
+func setupTypeMismatchFixture(t *testing.T, ctx context.Context, q sqlpgq.Queryer) bool {
+	t.Helper()
+	stmts := splitSQLStatements(typeMismatchFixtureSQL)
+	for _, stmt := range stmts {
+		stmt = strings.TrimSpace(stmt)
+		if stmt == "" {
+			continue
+		}
+		rows, err := q.Query(ctx, stmt)
+		if err != nil {
+			// A DROP failing is benign; a CREATE failing means PG19 refused the
+			// shape — skip the dependent assertion rather than fail.
+			if strings.HasPrefix(strings.ToUpper(stmt), "CREATE PROPERTY GRAPH") {
+				t.Logf("PG19 rejected the type-mismatch property graph (expected on some betas): %v", err)
+				return false
+			}
+			continue
+		}
+		rows.Close()
+	}
+	return true
+}
+
+func TestGetMetadata_FlagsEndpointTypeMismatch(t *testing.T) {
+	ctx, p := openPool(t)
+	if !setupTypeMismatchFixture(t, ctx, p.Q()) {
+		t.Skip("type-mismatch property graph not creatable on this PG19 build")
+	}
+
+	oid := graphOIDByName(t, ctx, p, "bugtest_typemismatch_g")
+	md, err := sqlpgq.GetMetadata(ctx, p.Q(), oid)
+	if err != nil {
+		t.Fatalf("GetMetadata: %v", err)
+	}
+	if len(md.Edges) != 1 {
+		t.Fatalf("want 1 edge, got %d", len(md.Edges))
+	}
+	e := md.Edges[0]
+	d := findDiagnostic(e.Diagnostics, "endpoint-key-type-mismatch")
+	if d == nil {
+		t.Fatalf("expected endpoint-key-type-mismatch diagnostic on edge %q, got %+v", e.Alias, e.Diagnostics)
+	}
+	if d.Severity != "error" {
+		t.Errorf("endpoint-key-type-mismatch severity = %q, want error", d.Severity)
+	}
+	// Both ends mismatch (int vs uuid); expect a diagnostic per side.
+	sides := map[string]bool{}
+	for _, dd := range e.Diagnostics {
+		if dd.Code == "endpoint-key-type-mismatch" {
+			sides[dd.Field] = true
+		}
+	}
+	if !sides["source"] || !sides["destination"] {
+		t.Errorf("expected both source and destination type-mismatch diagnostics, got %v", sides)
+	}
+}
+
+func TestGetMetadata_FlagsExpressionBackedKey(t *testing.T) {
+	ctx, p := openPool(t)
+	setupDiagnosticsFixture(t, ctx, p.Q())
+
+	oid := graphOIDByName(t, ctx, p, "bugtest_exprkey_g")
+	md, err := sqlpgq.GetMetadata(ctx, p.Q(), oid)
+	if err != nil {
+		t.Fatalf("GetMetadata: %v", err)
+	}
+	if len(md.Vertices) != 1 {
+		t.Fatalf("want 1 vertex, got %d", len(md.Vertices))
+	}
+	v := md.Vertices[0]
+	d := findDiagnostic(v.Diagnostics, "expression-backed-key")
+	if d == nil {
+		t.Fatalf("expected expression-backed-key diagnostic on %q, got %+v", v.Alias, v.Diagnostics)
+	}
+	if d.Severity != "warning" {
+		t.Errorf("expression-backed-key severity = %q, want warning", d.Severity)
 	}
 }
 
