@@ -8,9 +8,10 @@
 -- single synthesized vertex/edge id. Surface this as a warning so users see
 -- it.
 --
--- We accept ANY unique index whose indkey, treated as a set, equals the
--- element's pgekey. Index column order is irrelevant for the uniqueness
--- guarantee; only the column set matters.
+-- We accept ANY unique index whose KEY columns (the first indnkeyatts entries
+-- of indkey; trailing INCLUDE/covering columns are excluded), treated as a set,
+-- equal the element's pgekey. Index column order is irrelevant for the
+-- uniqueness guarantee; only the column set matters.
 --
 -- Excluded:
 --   - indpred IS NOT NULL  (partial indexes only enforce uniqueness within
@@ -32,8 +33,12 @@ SELECT
           AND ix.indpred  IS NULL
           AND ix.indexprs IS NULL
           AND (
+              -- Compare only the KEY columns. A covering UNIQUE ... INCLUDE (...)
+              -- index lists the INCLUDE attnums in indkey too, but they do NOT
+              -- participate in uniqueness, so slice indkey to its first
+              -- indnkeyatts entries before set-comparing against pgekey.
               SELECT array_agg(k::int2 ORDER BY k)
-              FROM unnest(ix.indkey::int2[]) k
+              FROM unnest((ix.indkey::int2[])[1:ix.indnkeyatts]) k
               WHERE k <> 0
           ) = (
               SELECT array_agg(k ORDER BY k)

@@ -34,7 +34,8 @@ type queryRequest struct {
 	Limit    int              `json:"limit,omitempty"`
 	Bindings []sqlpgq.Binding `json:"bindings,omitempty"`
 	// Optional lateral form: when From is non-empty, the projection becomes
-	//   SELECT * FROM <From...>, LATERAL GRAPH_TABLE (...) <LateralAlias>
+	//   SELECT * FROM <From...>, GRAPH_TABLE (...) <LateralAlias>
+	// (GRAPH_TABLE is implicitly lateral; PG19 rejects an explicit LATERAL here)
 	// From items are raw SQL fragments — caller-supplied, caller-trusted.
 	From         []string `json:"from,omitempty"`
 	LateralAlias string   `json:"lateral_alias,omitempty"`

@@ -134,7 +134,10 @@ const (
 //
 // LateralFrom: when non-empty, the outer SELECT becomes
 //
-//	SELECT * FROM <from1>, <from2>, ..., LATERAL GRAPH_TABLE(...) <alias>
+//	SELECT * FROM <from1>, <from2>, ..., GRAPH_TABLE(...) <alias>
+//
+// (no LATERAL keyword: PG19 rejects it before GRAPH_TABLE, which is implicitly
+// lateral, so a plain comma join both parses and correlates.)
 //
 // instead of `SELECT * FROM GRAPH_TABLE(...)`. From items are raw SQL
 // fragments — the caller is responsible for quoting / safety. LateralAlias
@@ -416,8 +419,9 @@ func graphTableBlock(md *GraphMetadata, match, where string, cols []string) stri
 }
 
 // assembleSQL builds the final statement from the projected COLUMNS list.
-// When opts.LateralFrom is non-empty the GRAPH_TABLE is joined laterally
-// after those FROM items; otherwise it is the sole FROM item.
+// When opts.LateralFrom is non-empty the GRAPH_TABLE is joined as a plain comma
+// FROM item (it is implicitly lateral) after those FROM items; otherwise it is
+// the sole FROM item.
 func assembleSQL(md *GraphMetadata, cols []string, opts ProjectionOpts) (string, error) {
 	// Filter out empty/whitespace-only From items so callers can pass nil
 	// or an unfiltered slice without changing the default code path.
@@ -441,7 +445,10 @@ func assembleSQL(md *GraphMetadata, cols []string, opts ProjectionOpts) (string,
 		}
 		sb.WriteString("SELECT * FROM ")
 		sb.WriteString(strings.Join(fromItems, ", "))
-		sb.WriteString(", LATERAL ")
+		// GRAPH_TABLE is implicitly lateral in PG19; the explicit LATERAL keyword
+		// is a syntax error before it. Joining it as a plain comma FROM item still
+		// lets the pattern correlate to the preceding From items.
+		sb.WriteString(", ")
 		sb.WriteString(block)
 		sb.WriteString(" ")
 		sb.WriteString(pgQuoteIdent(alias))

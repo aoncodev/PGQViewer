@@ -276,7 +276,14 @@ function parseChunkBody(body: string): ParsedChunk {
   if (!isKeywordAt(body, i, 'IS')) {
     const aliasMatch = matchAt(ID_RE, body, i);
     if (aliasMatch) {
-      alias = aliasMatch[0];
+      // Fold the alias to lowercase. PostgreSQL folds the unquoted element
+      // variable in the MATCH text (which we forward verbatim) to lowercase,
+      // but the server quotes the binding alias inside COLUMNS (`"A"."prop"`).
+      // An uppercase/mixed-case alias would then reference a variable that no
+      // longer exists after folding ("missing FROM-clause entry for table A").
+      // matchBindings only parses unquoted identifiers, so unconditional
+      // folding here mirrors PG's own identifier rules.
+      alias = aliasMatch[0].toLowerCase();
       i += aliasMatch[0].length;
     }
   }
@@ -294,7 +301,10 @@ function parseChunkBody(body: string): ParsedChunk {
       if (!labelMatch) {
         return { alias, error: `expected a label name after IS in \`(${body.trim()})\`` };
       }
-      const label = labelMatch[0];
+      // Fold the label the same way: an unquoted `IS Person` is folded to
+      // `person` by PG, which is how it is stored in the catalog (pgllabel) and
+      // therefore how it must compare against element labels in resolveElement.
+      const label = labelMatch[0].toLowerCase();
       const afterLabel = skipWS(body, i + labelMatch[0].length);
       if (body[afterLabel] === '|') {
         // Keep this wording in sync with the matching pattern in

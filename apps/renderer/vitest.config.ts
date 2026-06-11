@@ -7,5 +7,8 @@ export default defineConfig({
   test: {
     environment: 'jsdom',
     include: ['src/**/*.test.ts'],
+    // Node 25's partial built-in `localStorage` shadows jsdom's; the setup file
+    // installs a spec-compliant in-memory Storage. See vitest.setup.ts.
+    setupFiles: ['./vitest.setup.ts'],
   },
 });

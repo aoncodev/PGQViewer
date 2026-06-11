@@ -198,6 +198,39 @@ func TestBuildProjection_CustomColumns(t *testing.T) {
 	}
 }
 
+// TestBuildProjection_LateralForm pins that the lateral From form joins
+// GRAPH_TABLE WITHOUT the LATERAL keyword — PG19 rejects `LATERAL GRAPH_TABLE`,
+// which is already implicitly lateral. Regression for the LATERAL fix.
+func TestBuildProjection_LateralForm(t *testing.T) {
+	md := &sqlpgq.GraphMetadata{
+		Graph: sqlpgq.Graph{Schema: "public", Name: "social"},
+		Vertices: []sqlpgq.Element{{
+			OID: 100, Alias: "people", Kind: "v", PK: []string{"id"},
+			Labels:     []string{"person"},
+			Properties: []sqlpgq.Property{{Name: "id", Type: "integer"}, {Name: "name", Type: "text"}},
+		}},
+	}
+	pq, err := sqlpgq.BuildProjectionWithOpts(sqlpgq.ProjectionOpts{
+		Metadata:     md,
+		Bindings:     []sqlpgq.Binding{{Alias: "a", ElementOID: 100}},
+		Match:        "(a IS person)",
+		LateralFrom:  []string{"(VALUES (1)) v(x)"},
+		LateralAlias: "gt",
+	})
+	if err != nil {
+		t.Fatalf("BuildProjectionWithOpts: %v", err)
+	}
+	if strings.Contains(strings.ToUpper(pq.SQL), "LATERAL") {
+		t.Fatalf("lateral form must NOT contain the LATERAL keyword (PG19 rejects it):\n%s", pq.SQL)
+	}
+	if !strings.Contains(pq.SQL, "GRAPH_TABLE") {
+		t.Fatalf("expected GRAPH_TABLE in lateral form:\n%s", pq.SQL)
+	}
+	if !strings.Contains(pq.SQL, "(VALUES (1)) v(x)") || !strings.Contains(pq.SQL, `"gt"`) {
+		t.Fatalf("lateral From item / alias missing:\n%s", pq.SQL)
+	}
+}
+
 // TestBuildProjection_WideElementTrim checks that an element with more than the
 // threshold count of properties and no explicit DisplayProperties is trimmed
 // to a heuristic display set, with PK still projected and a TrimInfo recorded.
