@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { EditorState, Compartment } from '@codemirror/state';
-import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection, dropCursor, rectangularSelection, crosshairCursor, highlightActiveLineGutter, highlightSpecialChars } from '@codemirror/view';
+import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection, dropCursor, rectangularSelection, crosshairCursor, highlightActiveLineGutter, highlightSpecialChars, placeholder as cmPlaceholder } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 import { searchKeymap } from '@codemirror/search';
 import { autocompletion, completionKeymap, type CompletionContext, type Completion } from '@codemirror/autocomplete';
@@ -157,11 +157,18 @@ function enclosingElementKind(
   return null;
 }
 
-function makeGraphCompletions(getMeta: () => GraphMetadata | null) {
+function makeGraphCompletions(
+  getMeta: () => GraphMetadata | null,
+  getPatternDoc: () => string | null,
+) {
   return function graphCompletions(context: CompletionContext) {
     const meta = getMeta();
     if (!meta) return null;
     const doc = context.state.doc.toString();
+    // Aliases/properties resolve against the MATCH pattern. Normally that is
+    // this editor's own doc; a predicate-only editor (the WHERE pane) passes
+    // the pattern editor's doc in via patternContext instead.
+    const patternDoc = getPatternDoc() ?? doc;
     const pos = context.pos;
     const before = doc.slice(0, pos);
 
@@ -171,7 +178,7 @@ function makeGraphCompletions(getMeta: () => GraphMetadata | null) {
     const dotted = context.matchBefore(/[A-Za-z_][A-Za-z_0-9]*\.[A-Za-z_0-9]*/);
     if (dotted) {
       const [alias] = dotted.text.split('.');
-      const el = aliasElementMap(doc, meta).get(alias!);
+      const el = aliasElementMap(patternDoc, meta).get(alias!);
       if (el) {
         const dotAt = dotted.from + alias!.length + 1;
         const options: Completion[] = el.properties.map((p) => ({
@@ -215,7 +222,7 @@ function makeGraphCompletions(getMeta: () => GraphMetadata | null) {
     // complete or the user explicitly asked.
     const word = context.matchBefore(/[A-Za-z_][A-Za-z_0-9]*/);
     if (word && (word.from !== word.to || context.explicit)) {
-      const aliases = Array.from(aliasElementMap(doc, meta).keys());
+      const aliases = Array.from(aliasElementMap(patternDoc, meta).keys());
       if (aliases.length > 0) {
         const options: Completion[] = aliases.map((alias) => ({
           label: alias,
@@ -244,6 +251,7 @@ const editorTheme = EditorView.theme({
       'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace',
   },
   '.cm-content': { caretColor: 'var(--accent)', padding: '8px 0' },
+  '.cm-placeholder': { color: 'var(--fg-subtle)' },
   '.cm-cursor': { borderLeftColor: 'var(--accent)' },
   '&.cm-focused .cm-cursor': { borderLeftColor: 'var(--accent)' },
   '.cm-gutters': {
@@ -304,6 +312,19 @@ interface SqlEditorProps {
    * Null/undefined (SQL mode) leaves the editor's SQL completion unchanged.
    */
   graphMeta?: GraphMetadata | null;
+  /**
+   * External MATCH pattern for alias/property autocomplete. A predicate-only
+   * editor (the graph-mode WHERE pane) holds no pattern of its own, so the
+   * graph completion source resolves aliases against this text instead of the
+   * editor's document.
+   */
+  patternContext?: string;
+  /**
+   * Compact chrome for small inline fields: no line numbers, fold gutter, or
+   * active-line gutter. The language, highlighting, and completions are the
+   * same as the full editor.
+   */
+  compact?: boolean;
   className?: string;
   minHeight?: string;
   /**
@@ -323,6 +344,8 @@ export function SqlEditor({
   placeholder,
   schema,
   graphMeta,
+  patternContext,
+  compact = false,
   className,
   minHeight = '120px',
   heightPx,
@@ -330,14 +353,16 @@ export function SqlEditor({
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
   const langCompRef = useRef(new Compartment());
+  const placeholderCompRef = useRef(new Compartment());
   const onSubmitRef = useRef(onSubmit);
   const onChangeRef = useRef(onChange);
   const onHistoryPrevRef = useRef(onHistoryPrev);
   const onHistoryNextRef = useRef(onHistoryNext);
-  // Latest graph metadata, read by the graph completion source. Held in a ref
-  // so the editor (initialized once) always sees current metadata without a
-  // reconfigure on every metadata change.
+  // Latest graph metadata / external pattern, read by the graph completion
+  // source. Held in refs so the editor (initialized once) always sees current
+  // values without a reconfigure on every change.
   const graphMetaRef = useRef<GraphMetadata | null>(graphMeta ?? null);
+  const patternContextRef = useRef<string | null>(patternContext ?? null);
 
   useEffect(() => {
     onSubmitRef.current = onSubmit;
@@ -345,6 +370,7 @@ export function SqlEditor({
     onHistoryPrevRef.current = onHistoryPrev;
     onHistoryNextRef.current = onHistoryNext;
     graphMetaRef.current = graphMeta ?? null;
+    patternContextRef.current = patternContext ?? null;
   });
 
   // Initialize once.
@@ -354,11 +380,13 @@ export function SqlEditor({
     const baseState = EditorState.create({
       doc: value,
       extensions: [
-        lineNumbers(),
-        highlightActiveLineGutter(),
+        // Compact mode drops the gutters; without them the content needs its
+        // own horizontal padding (inline style so it beats the theme rule).
+        ...(compact
+          ? [EditorView.contentAttributes.of({ style: 'padding: 8px 10px' })]
+          : [lineNumbers(), highlightActiveLineGutter(), foldGutter()]),
         highlightSpecialChars(),
         history(),
-        foldGutter(),
         drawSelection(),
         dropCursor(),
         EditorState.allowMultipleSelections.of(true),
@@ -370,9 +398,16 @@ export function SqlEditor({
         crosshairCursor(),
         highlightActiveLine(),
         autocompletion({
-          override: [makeGraphCompletions(() => graphMetaRef.current), pgqCompletions],
+          override: [
+            makeGraphCompletions(
+              () => graphMetaRef.current,
+              () => patternContextRef.current,
+            ),
+            pgqCompletions,
+          ],
         }),
         langCompRef.current.of(sql({ dialect: PostgreSQL, schema })),
+        placeholderCompRef.current.of(placeholder ? cmPlaceholder(placeholder) : []),
         keymap.of([
           {
             key: 'Mod-Enter',
@@ -447,6 +482,18 @@ export function SqlEditor({
       effects: langCompRef.current.reconfigure(sql({ dialect: PostgreSQL, schema })),
     });
   }, [schema]);
+
+  // Keep the visible placeholder in sync (it changes when the mode flips
+  // between graph and SQL).
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: placeholderCompRef.current.reconfigure(
+        placeholder ? cmPlaceholder(placeholder) : [],
+      ),
+    });
+  }, [placeholder]);
 
   return (
     <div

@@ -3,6 +3,7 @@ import {
   cancelQuery,
   streamExpand,
   streamQuery,
+  type GraphMetadata,
   type MetaEvent,
   type QueryEvent,
 } from '../lib/api';
@@ -835,7 +836,13 @@ export function Workspace() {
             {mode === 'graph' && (
               <>
                 <div className="mt-2">
-                  <WherePane value={whereText} onChange={setWhereText} />
+                  <WherePane
+                    value={whereText}
+                    onChange={setWhereText}
+                    onSubmit={run}
+                    graphMeta={metadata}
+                    patternText={editorValue}
+                  />
                 </div>
                 {SHOW_LATERAL_PANE && (
                   <div className="mt-2">
@@ -1046,7 +1053,22 @@ function ParamsPane({ value, onChange }: { value: string; onChange: (v: string) 
 
 // Dedicated WHERE input for graph mode. The pattern stays in the editor; this
 // rides along as request.where so the server appends a top-level WHERE.
-function WherePane({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+// A compact SqlEditor (not a textarea) so the predicate gets the same syntax
+// highlighting and graph-aware completions as the pattern; patternContext
+// feeds it the MATCH pattern so aliases/properties resolve.
+function WherePane({
+  value,
+  onChange,
+  onSubmit,
+  graphMeta,
+  patternText,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  onSubmit?: () => void;
+  graphMeta?: GraphMetadata | null;
+  patternText?: string;
+}) {
   // Open by default once the user has typed something, so a restored draft is
   // visible without a click.
   const [expanded, setExpanded] = useState(() => value.trim().length > 0);
@@ -1060,12 +1082,16 @@ function WherePane({ value, onChange }: { value: string; onChange: (v: string) =
         <span>{expanded ? '▾' : '▸'}</span>
       </button>
       {expanded && (
-        <textarea
+        <SqlEditor
           value={value}
-          onChange={(e) => onChange(e.target.value)}
+          onChange={onChange}
+          onSubmit={onSubmit}
+          compact
+          graphMeta={graphMeta}
+          patternContext={patternText}
           placeholder="Top-level predicate, e.g. a.age > 30 OR b.city = 'NYC'"
-          className="block w-full resize-y border-t border-border bg-bg px-3 py-2 font-mono text-xs text-fg outline-none"
-          rows={2}
+          className="overflow-hidden rounded-b-md border-t border-border bg-bg"
+          minHeight="52px"
         />
       )}
     </div>
