@@ -272,14 +272,16 @@ const PATTERNS: Pattern[] = [
   // PostgreSQL. They surface as ordinary `error` events, so they ride the
   // same matchHint path; needles below mirror those Go format strings.
   {
-    // projection.go validateBinding: PK / source / destination key columns
-    // `%v are not declared as properties`. The viewer synthesizes element
-    // identity from those columns, so they must be projectable, and SQL/PGQ
-    // only allows declared properties inside COLUMNS.
-    needles: ['are not declared as properties'],
+    // projection.go validateBinding: the residual hard error after the viewer
+    // learned to DEGRADE most keyless graphs. A vertex whose KEY isn't exposed
+    // as a property now falls back to a property-derived identity and renders
+    // fine; this fires only when there's ALSO no other property — i.e. nothing
+    // at all to identify the vertex by, which PG can't surface to a query
+    // either. (A KEY column simply being unexposed is no longer an error.)
+    needles: ['nothing to identify this vertex by'],
     hint: {
-      title: 'Key columns not exposed as properties',
-      hint: 'The viewer builds each element\'s identity from its KEY / endpoint columns, but those columns are not declared as properties so they can\'t be selected inside COLUMNS. Recreate the graph with CREATE PROPERTY GRAPH ... PROPERTIES ALL COLUMNS (or list the key columns in PROPERTIES (...)).',
+      title: 'Vertex has no identifiable column',
+      hint: 'This vertex exposes neither its KEY columns nor any other property, so there is no column the viewer can use to tell its rows apart on the canvas. List at least one column in PROPERTIES (...) — or drop the clause entirely to expose all columns (PostgreSQL\'s default).',
       docsHref: DOCS_CREATE,
     },
   },

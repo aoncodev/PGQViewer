@@ -118,6 +118,16 @@ func (s *Server) Expand(w http.ResponseWriter, r *http.Request) {
 				req.AnchorElementOID, md.Graph.Schema, md.Graph.Name))
 		return
 	}
+	// A keyless/degraded anchor (KEY not exposed as a property) derives its node
+	// id from other columns, so the posted anchor_pk neither matches the PK arity
+	// nor round-trips to it. Catch it here for a clear message, before the generic
+	// arity check below mistakes it for a malformed request.
+	if !sqlpgq.AnchorExpandable(anchor) {
+		writeErr(w, http.StatusBadRequest,
+			fmt.Sprintf("vertex %q in graph %s.%s can't be expanded: its KEY columns %v are not exposed as properties, so node identity can't be round-tripped — view this graph with a graph-mode query instead",
+				anchor.Alias, md.Graph.Schema, md.Graph.Name, anchor.PK))
+		return
+	}
 	if len(anchor.PK) != len(req.AnchorPK) {
 		writeErr(w, http.StatusBadRequest,
 			fmt.Sprintf("anchor_pk length %d does not match element PK arity %d",

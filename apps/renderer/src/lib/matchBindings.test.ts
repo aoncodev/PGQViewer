@@ -82,8 +82,74 @@ test('binds vertex alias to vertex element, edge alias to edge element', () => {
   expect(r.bindings.sort((x, y) => x.alias.localeCompare(y.alias))).toEqual([
     { alias: 'a', element_oid: 100, label: 'person' },
     { alias: 'b', element_oid: 100, label: 'person' },
-    { alias: 'k', element_oid: 200, label: 'knows' },
+    // The edge carries its pattern topology for within-row endpoint linking.
+    { alias: 'k', element_oid: 200, label: 'knows', source_alias: 'a', destination_alias: 'b' },
   ]);
+});
+
+// ───────── edge topology (computeEdgeTopology) ─────────
+// The server uses source_alias/destination_alias to link edges within a result
+// row, so direction and adjacency must be exact. Helper to pull one edge binding.
+const edgeBinding = (match: string, alias: string) => {
+  const r = inferBindings(match, meta);
+  expect(r.error).toBeUndefined();
+  return r.bindings.find((b) => b.alias === alias);
+};
+
+test('topology: forward edge -> source=left, destination=right', () => {
+  expect(edgeBinding('(a IS person)-[k IS knows]->(b IS person)', 'k')).toMatchObject({
+    source_alias: 'a',
+    destination_alias: 'b',
+  });
+});
+
+test('topology: reversed edge <- swaps source and destination', () => {
+  expect(edgeBinding('(a IS person)<-[k IS knows]-(b IS person)', 'k')).toMatchObject({
+    source_alias: 'b',
+    destination_alias: 'a',
+  });
+});
+
+test('topology: undirected edge defaults to left->right (best effort)', () => {
+  expect(edgeBinding('(a IS person)-[k IS knows]-(b IS person)', 'k')).toMatchObject({
+    source_alias: 'a',
+    destination_alias: 'b',
+  });
+});
+
+test('topology: chained pattern gives each edge its adjacent vertices', () => {
+  const m = '(a IS person)-[k1 IS knows]->(b IS person)-[k2 IS knows]->(c IS person)';
+  expect(edgeBinding(m, 'k1')).toMatchObject({ source_alias: 'a', destination_alias: 'b' });
+  expect(edgeBinding(m, 'k2')).toMatchObject({ source_alias: 'b', destination_alias: 'c' });
+});
+
+test('topology: self-loop binds the same alias on both ends', () => {
+  expect(edgeBinding('(a IS person)-[k IS knows]->(a IS person)', 'k')).toMatchObject({
+    source_alias: 'a',
+    destination_alias: 'a',
+  });
+});
+
+test('topology: anonymous endpoint omits that side (server falls back to value-based)', () => {
+  const k = edgeBinding('(a IS person)-[k IS knows]->()', 'k');
+  expect(k?.source_alias).toBe('a');
+  expect(k?.destination_alias).toBeUndefined();
+});
+
+test('topology: a WHERE expression with </> does not corrupt direction', () => {
+  // The `<` inside the anchor's WHERE must not be read as a reversed connector.
+  expect(
+    edgeBinding('(a IS person WHERE a.id < 5)-[k IS knows]->(b IS person)', 'k'),
+  ).toMatchObject({ source_alias: 'a', destination_alias: 'b' });
+});
+
+test('topology: anonymous/abbreviated edges produce no topology', () => {
+  // Anonymous edge — no edge binding at all, so no stray topology on the vertices.
+  const anon = inferBindings('(a IS person)-[]->(b IS person)', meta);
+  expect(anon.bindings.every((b) => !b.source_alias && !b.destination_alias)).toBe(true);
+  // Abbreviated edge (no [...]) — likewise.
+  const abbrev = inferBindings('(a IS person)->(b IS person)', meta);
+  expect(abbrev.bindings.every((b) => !b.source_alias && !b.destination_alias)).toBe(true);
 });
 
 test('kind-aware lookup: same label name on both kinds binds correctly', () => {

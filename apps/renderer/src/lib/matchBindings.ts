@@ -150,14 +150,112 @@ export function inferBindings(
     );
   }
 
+  // Edge topology: which vertex aliases each edge connects, and in which
+  // direction. The server uses this to link edges within a single result row,
+  // so a graph whose KEY / endpoint columns aren't exposed as properties still
+  // renders (PG's MATCH already resolved the connection; the FK values are never
+  // needed). For a graph that DOES expose its keys this is redundant — the
+  // server derives byte-identical ids either way — so it's always safe to send.
+  const topo = computeEdgeTopology(match);
+
   return {
-    bindings: Array.from(byAlias.values()).map(({ alias, element_oid, label }) => ({
-      alias,
-      element_oid,
-      ...(label ? { label } : {}),
-    })),
+    bindings: Array.from(byAlias.values()).map(({ alias, element_oid, label, kind }) => {
+      const binding: Binding = {
+        alias,
+        element_oid,
+        ...(label ? { label } : {}),
+      };
+      if (kind === 'edge') {
+        const t = topo.get(alias);
+        if (t?.source) binding.source_alias = t.source;
+        if (t?.dest) binding.destination_alias = t.dest;
+      }
+      return binding;
+    }),
     ...(warnings.length > 0 ? { warnings } : {}),
   };
+}
+
+// ───────── edge topology ─────────
+
+interface SeqElement {
+  kind: 'vertex' | 'edge';
+  alias?: string;
+}
+
+// computeEdgeTopology maps each aliased edge to the vertex aliases on its source
+// and destination ends, honouring arrow direction. `(a)-[e]->(b)` → e: {source:
+// a, dest: b}; `(a)<-[e]-(b)` → e: {source: b, dest: a}. An undirected `-[e]-`
+// is treated as left→right (best effort — PG matches both ways, and the viewer
+// has to pick an orientation to draw). Endpoints that are anonymous `()` or
+// missing contribute no alias, leaving the server to fall back to value-based
+// linking for that end.
+function computeEdgeTopology(
+  match: string,
+): Map<string, { source?: string; dest?: string }> {
+  const { seq, conns } = extractSequence(match);
+  const topo = new Map<string, { source?: string; dest?: string }>();
+  for (let i = 0; i < seq.length; i++) {
+    const edge = seq[i]!;
+    if (edge.kind !== 'edge' || !edge.alias) continue;
+    const left = seq[i - 1];
+    const right = seq[i + 1];
+    const connBefore = conns[i - 1] ?? ''; // between left and this edge
+    const connAfter = conns[i] ?? ''; // between this edge and right
+    // The arrow head picks the source end: `->` after ⇒ left is source; `<-`
+    // before ⇒ right is source; otherwise (undirected) default left→right.
+    let sourceEl: SeqElement | undefined;
+    let destEl: SeqElement | undefined;
+    if (connAfter.includes('>')) {
+      sourceEl = left;
+      destEl = right;
+    } else if (connBefore.includes('<')) {
+      sourceEl = right;
+      destEl = left;
+    } else {
+      sourceEl = left;
+      destEl = right;
+    }
+    const entry: { source?: string; dest?: string } = {};
+    if (sourceEl?.kind === 'vertex' && sourceEl.alias) entry.source = sourceEl.alias;
+    if (destEl?.kind === 'vertex' && destEl.alias) entry.dest = destEl.alias;
+    topo.set(edge.alias, entry);
+  }
+  return topo;
+}
+
+// extractSequence walks the top-level pattern into an ordered list of elements
+// (vertex / edge chunks, each with its parsed alias) plus the connector text
+// between consecutive elements (`-`, `->`, `<-`). conns[k] is the text between
+// seq[k] and seq[k+1]. Shares the string-literal- and nesting-aware scanning of
+// extractElementChunks so connectors inside a WHERE expression can't leak in.
+function extractSequence(match: string): { seq: SeqElement[]; conns: string[] } {
+  const seq: SeqElement[] = [];
+  const conns: string[] = [];
+  let i = 0;
+  let pendingConn = '';
+  let sawFirst = false;
+  while (i < match.length) {
+    const c = match[i]!;
+    if (c === "'") {
+      i = skipString(match, i);
+      continue;
+    }
+    if (c === '(' || c === '[') {
+      const end = findMatching(match, i);
+      if (end < 0) break;
+      const parsed = parseChunkBody(match.slice(i + 1, end));
+      if (sawFirst) conns.push(pendingConn);
+      seq.push({ kind: c === '(' ? 'vertex' : 'edge', alias: parsed.alias });
+      pendingConn = '';
+      sawFirst = true;
+      i = end + 1;
+      continue;
+    }
+    if (sawFirst) pendingConn += c;
+    i++;
+  }
+  return { seq, conns };
 }
 
 // hasAbbreviatedEdge detects a vertex-to-vertex connector with no `[...]`

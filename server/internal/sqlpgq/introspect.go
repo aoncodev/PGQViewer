@@ -144,6 +144,7 @@ func GetMetadata(ctx context.Context, db Queryer, oid uint32) (*GraphMetadata, e
 		Definition: strings.TrimSpace(header.Definition),
 	}
 	for _, e := range elements {
+		normalizeElementLists(&e)
 		switch e.Kind {
 		case "v":
 			md.Vertices = append(md.Vertices, e)
@@ -152,6 +153,40 @@ func GetMetadata(ctx context.Context, db Queryer, oid uint32) (*GraphMetadata, e
 		}
 	}
 	return md, nil
+}
+
+// normalizeElementLists guarantees an element's list fields are non-nil so they
+// marshal as `[]`, not `null`. The client types them as plain arrays (e.g.
+// `properties: Property[]`) and reads `.length` / `.some` on them; a NO
+// PROPERTIES edge otherwise leaves Properties nil and crashes the schema
+// sidebar. Covers the per-element lists plus both edge ends' Key/Ref.
+func normalizeElementLists(e *Element) {
+	if e.Properties == nil {
+		e.Properties = []Property{}
+	}
+	if e.Labels == nil {
+		e.Labels = []string{}
+	}
+	if e.PK == nil {
+		e.PK = []string{}
+	}
+	normalizeEdgeEnd(e.Source)
+	normalizeEdgeEnd(e.Destination)
+}
+
+// normalizeEdgeEnd guarantees an edge end's Key/Ref slices marshal as `[]`, not
+// `null`, mirroring the per-element list-field normalization. No-op for a nil
+// end (vertices).
+func normalizeEdgeEnd(e *EdgeEnd) {
+	if e == nil {
+		return
+	}
+	if e.Key == nil {
+		e.Key = []string{}
+	}
+	if e.Ref == nil {
+		e.Ref = []string{}
+	}
 }
 
 // sameKeyColumns reports whether two column lists are equal as ordered
@@ -361,15 +396,54 @@ func expressionBackedKeyColumn(el *Element, col string) (string, bool) {
 			return "", false
 		}
 	}
-	// No plain backing. If a NON-simple expression property exists at all, the
-	// key column is reachable only through computed expressions — flag the
-	// first one as the likely culprit.
+	// No plain backing. Flag the key column as expression-backed only when a
+	// NON-simple expression property actually REFERENCES it (e.g. `id + 1 AS x`
+	// over key column `id`). A property that merely happens to be a different
+	// plain column (e.g. PROPERTIES (name) over key `id`) must NOT be blamed —
+	// that's the "key simply isn't exposed" case, which the projection now
+	// handles by degrading rather than warning here.
 	for _, p := range el.Properties {
-		if p.Expression != nil && !simpleColumnExprMatches(*p.Expression, col) {
+		if p.Expression != nil &&
+			!simpleColumnExprMatches(*p.Expression, col) &&
+			exprMentionsColumn(*p.Expression, col) {
 			return p.Name, true
 		}
 	}
 	return "", false
+}
+
+// exprMentionsColumn reports whether a property expression references the given
+// column name as a whole identifier (bare or double-quoted), so we don't blame
+// an unrelated expression. A loose substring check would false-match `id` inside
+// `width`; this requires identifier boundaries.
+func exprMentionsColumn(expr, col string) bool {
+	return mentionsIdent(expr, col) || mentionsIdent(expr, pgQuoteIdent(col))
+}
+
+func mentionsIdent(haystack, needle string) bool {
+	if needle == "" {
+		return false
+	}
+	isIdentRune := func(b byte) bool {
+		return b == '_' ||
+			(b >= 'a' && b <= 'z') ||
+			(b >= 'A' && b <= 'Z') ||
+			(b >= '0' && b <= '9')
+	}
+	for from := 0; ; {
+		idx := strings.Index(haystack[from:], needle)
+		if idx < 0 {
+			return false
+		}
+		start := from + idx
+		end := start + len(needle)
+		beforeOK := start == 0 || !isIdentRune(haystack[start-1])
+		afterOK := end == len(haystack) || !isIdentRune(haystack[end])
+		if beforeOK && afterOK {
+			return true
+		}
+		from = start + 1
+	}
 }
 
 // expressionKeyDiagnostic builds the warning for an expression-backed key
@@ -455,6 +529,11 @@ func GetCounts(ctx context.Context, db rowQuerier, oid uint32) ([]LabelCount, er
 	}
 	for i := range out {
 		out[i].Labels = labelsByOID[out[i].ElementOID]
+		if out[i].Labels == nil {
+			// Non-nil so it marshals as `[]`, not `null` — same JSON contract as
+			// the metadata list fields, even though no consumer iterates it yet.
+			out[i].Labels = []string{}
+		}
 	}
 	return out, nil
 }

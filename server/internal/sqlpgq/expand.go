@@ -213,6 +213,10 @@ func buildOneExpansion(
 	// projected ID will still dedup correctly on the client.
 	match.WriteString("(b)")
 
+	if err := ensureExpandable(anchor, edge, other); err != nil {
+		return nil, err
+	}
+
 	bindings := []Binding{
 		{Alias: "a", ElementOID: anchor.OID},
 		{Alias: "k", ElementOID: edge.OID},
@@ -446,6 +450,17 @@ func buildOneRecursiveExpansion(
 		if maxDepth > 1 {
 			maxDepth = 1
 		}
+	}
+
+	// Expansion can't support graphs that hide their KEY/endpoint columns from
+	// properties: it round-trips PK-derived node ids from the client and the
+	// recursiveProjectionColumns SELECT below names those columns directly, while
+	// BuildProjection's degraded path would project a different column set —
+	// silently misaligning the shared decoder. The /query path renders such
+	// graphs; expansion declines them cleanly. Must run BEFORE BuildProjection
+	// (which now degrades instead of erroring on hidden keys).
+	if err := ensureExpandable(anchor, edge, other); err != nil {
+		return ExpansionQuery{}, err
 	}
 
 	// Build the projection decoder for a/k/b reusing BuildProjection so the
@@ -747,4 +762,50 @@ func isSimpleIdent(s string) bool {
 // qualTable renders a schema-qualified, quoted table reference.
 func qualTable(t TableRef) string {
 	return pgQuoteIdent(t.Schema) + "." + pgQuoteIdent(t.Name)
+}
+
+// ensureExpandable rejects expansion when any participating element hides its
+// KEY (or, for the edge, SOURCE/DESTINATION KEY) columns from properties.
+// Expansion round-trips PK-derived node ids from the client and links edges by
+// FK value, and recursiveProjectionColumns names those columns directly — none
+// of which works when the columns aren't exposed. The /query path renders such
+// graphs via its degraded identity scheme; expansion declines them with a clear,
+// actionable error rather than emitting misaligned/garbled rows.
+func ensureExpandable(anchor, edge, other *Element) error {
+	for _, el := range []*Element{anchor, edge, other} {
+		if !elementIdentityExposed(el) {
+			return fmt.Errorf(
+				"cannot expand from %q: element %q's KEY columns %v are not exposed as properties, so identity can't be round-tripped across an expansion — open this graph with a graph-mode query (which renders it) instead",
+				anchor.Alias, el.Alias, formatColList(el.PK),
+			)
+		}
+	}
+	return nil
+}
+
+// AnchorExpandable reports whether a vertex element can anchor an expansion: its
+// KEY columns must be exposed as properties. The client's node id — and thus the
+// anchor_pk it posts back — encodes the KEY, but a keyless/degraded graph derives
+// node identity from OTHER columns, so the posted id neither matches the PK arity
+// nor round-trips to it. Callers check this up front to return a clear message
+// instead of the generic "anchor_pk length N does not match PK arity M".
+func AnchorExpandable(anchor *Element) bool {
+	return elementIdentityExposed(anchor)
+}
+
+// elementIdentityExposed reports whether every column the expansion path needs
+// to name — the element's KEY, plus an edge's SOURCE/DESTINATION KEY — is
+// reachable as a declared property. Mirrors the keysExposed check in
+// BuildProjectionWithOpts so the two paths agree on what "degraded" means.
+func elementIdentityExposed(el *Element) bool {
+	if len(missingKeyProperties(el, el.PK)) > 0 {
+		return false
+	}
+	if el.Source != nil && len(missingKeyProperties(el, el.Source.Key)) > 0 {
+		return false
+	}
+	if el.Destination != nil && len(missingKeyProperties(el, el.Destination.Key)) > 0 {
+		return false
+	}
+	return true
 }

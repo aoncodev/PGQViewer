@@ -151,6 +151,10 @@ export interface MetaEvent {
   }[];
   /** Present in graph-mode runs: the server's post-dedup element cap. */
   element_cap?: number;
+  /** Non-fatal degradation notices from the projection — e.g. a KEY column not
+   *  exposed as a property, so identity is approximated and dedup is
+   *  best-effort. Surfaced to the user as an advisory. */
+  warnings?: string[];
 }
 
 /**
@@ -209,6 +213,13 @@ export interface Binding {
   // that label's properties, since PG19 rejects `a.<prop>` for a property not
   // on the bound label. Omitted for an unlabeled pattern `(a)`.
   label?: string;
+  // Edge-only: the vertex aliases this edge connects in the MATCH pattern
+  // (`(a)-[e]->(b)` → source_alias "a", destination_alias "b"). The server uses
+  // these for within-row endpoint linking, which lets graphs whose KEY /
+  // endpoint columns are not exposed as properties still render (PG's MATCH
+  // already resolved the topology). Omitted for anonymous endpoints.
+  source_alias?: string;
+  destination_alias?: string;
 }
 
 export interface GraphQueryRequest {

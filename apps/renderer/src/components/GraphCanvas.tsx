@@ -33,6 +33,7 @@ import { parseElementId } from '../lib/elementId';
 import { toFiniteNumber } from '../lib/format';
 import { subscribeLabelOverrides } from '../lib/labelColors';
 import { getLabelCaption, subscribeLabelCaptions } from '../lib/labelCaptions';
+import { pickAutoCaption } from '../lib/autoCaption';
 import { CanvasFooter, type SelectionData } from './CanvasFooter';
 import { GraphToolbar } from './GraphToolbar';
 import { PropertyTooltip, type TooltipState } from './PropertyTooltip';
@@ -65,13 +66,10 @@ function vertexLabel(labels: string[], props: Record<string, unknown>): string {
       return String(props[cap]);
     }
   }
-  for (const k of ['name', 'title', 'label', 'display_name']) {
-    if (typeof props[k] === 'string') return String(props[k]);
-  }
-  for (const k of ['id', 'uuid', 'key']) {
-    if (props[k] !== undefined) return String(props[k]);
-  }
-  return '';
+  // No explicit caption: fall back to the auto heuristic, which always returns
+  // something when the node has any scalar property — important for keyless
+  // graphs whose hidden key column would otherwise leave the node blank.
+  return pickAutoCaption(props);
 }
 
 // Centroid of the current canvas content. New streamed nodes are seeded

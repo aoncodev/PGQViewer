@@ -328,7 +328,7 @@ func TestBuildProjection_ColumnMap(t *testing.T) {
 		t.Fatalf("BuildProjection: %v", err)
 	}
 	want := map[string]sqlpgq.ColumnMapping{
-		"a__pk__id": {Column: "a__pk__id", Alias: "a", Property: "id", Role: "pk"},
+		"a__pk__id":  {Column: "a__pk__id", Alias: "a", Property: "id", Role: "pk"},
 		"a__p__name": {Column: "a__p__name", Alias: "a", Property: "name", Role: "p"},
 	}
 	got := map[string]sqlpgq.ColumnMapping{}
@@ -593,7 +593,11 @@ func TestBuildProjection_AllowsAliasedEdgeKeyProperties(t *testing.T) {
 	}
 }
 
-func TestBuildProjection_RejectsMissingKeyProperty(t *testing.T) {
+// TestBuildProjection_DegradesMissingKeyProperty: a vertex whose KEY column is
+// NOT exposed as a property no longer errors — PG can still query such a graph,
+// so the viewer degrades to a property-derived identity and renders it, emitting
+// a warning. Regression for GitHub issue #1 ("Key columns not exposed").
+func TestBuildProjection_DegradesMissingKeyProperty(t *testing.T) {
 	md := &sqlpgq.GraphMetadata{
 		Graph: sqlpgq.Graph{Schema: "public", Name: "g"},
 		Vertices: []sqlpgq.Element{{
@@ -606,13 +610,174 @@ func TestBuildProjection_RejectsMissingKeyProperty(t *testing.T) {
 		}},
 	}
 
-	_, err := sqlpgq.BuildProjection(md,
+	pq, err := sqlpgq.BuildProjection(md,
 		[]sqlpgq.Binding{{Alias: "a", ElementOID: 100}},
 		"(a IS person)", "", 0)
-	if err == nil {
-		t.Fatal("expected missing key property error")
+	if err != nil {
+		t.Fatalf("expected degrade, got error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "PK columns [id] are not declared as properties") {
-		t.Fatalf("unexpected error: %v", err)
+	// The un-exposed KEY column must NOT be projected (PG would reject it); only
+	// the declared property is.
+	if strings.Contains(pq.SQL, "__pk__") {
+		t.Errorf("degraded projection should not emit a PK column:\n%s", pq.SQL)
+	}
+	if !strings.Contains(pq.SQL, `"a"."name" AS "a__p__name"`) {
+		t.Errorf("expected the property to be projected:\n%s", pq.SQL)
+	}
+	if len(pq.Warnings) == 0 {
+		t.Error("expected a degraded-identity warning")
+	}
+	// Identity falls back to the property value.
+	evs := pq.Decoder.Decode([]any{"Alice"})
+	if len(evs) != 1 || evs[0].ID != `100:["Alice"]` {
+		t.Fatalf("degraded vertex id = %+v, want 100:[\"Alice\"]", evs)
+	}
+}
+
+// TestBuildProjection_KeylessEdgeLinksWithinRow: an edge with NO PROPERTIES and
+// an un-exposed KEY still links its endpoints when the pattern binds them, by
+// borrowing the endpoint vertices' ids from the same row. The endpoint vertices
+// here are themselves keyless (identity from `name`), exercising the full
+// degraded path end to end.
+func TestBuildProjection_KeylessEdgeLinksWithinRow(t *testing.T) {
+	md := &sqlpgq.GraphMetadata{
+		Graph: sqlpgq.Graph{Schema: "public", Name: "g"},
+		Vertices: []sqlpgq.Element{{
+			OID: 100, Alias: "person2", Kind: "v", PK: []string{"id"},
+			Labels:     []string{"person"},
+			Properties: []sqlpgq.Property{{Name: "name", Type: "text"}},
+		}},
+		Edges: []sqlpgq.Element{{
+			OID: 200, Alias: "follows", Kind: "e", PK: []string{"a", "b"},
+			Labels: []string{"follows"},
+			// NO PROPERTIES: nothing projectable on the edge at all.
+			Source:      &sqlpgq.EdgeEnd{VertexOID: 100, Key: []string{"a"}, Ref: []string{"id"}},
+			Destination: &sqlpgq.EdgeEnd{VertexOID: 100, Key: []string{"b"}, Ref: []string{"id"}},
+		}},
+	}
+
+	pq, err := sqlpgq.BuildProjection(md,
+		[]sqlpgq.Binding{
+			{Alias: "s", ElementOID: 100, Label: "person"},
+			{Alias: "e", ElementOID: 200, Label: "follows", SourceAlias: "s", DestinationAlias: "d"},
+			{Alias: "d", ElementOID: 100, Label: "person"},
+		},
+		"(s IS person)-[e IS follows]->(d IS person)", "", 0)
+	if err != nil {
+		t.Fatalf("expected degrade, got error: %v", err)
+	}
+	// Sorted bindings: d, e, s. Columns are each vertex's name, the edge has none.
+	// Row layout: d.name, s.name  (edge contributes no column).
+	// Build a row where d=Bob, s=Alice.
+	var row []any
+	for _, m := range pq.ColumnMap {
+		switch {
+		case m.Alias == "d" && m.Property == "name":
+			row = append(row, "Bob")
+		case m.Alias == "s" && m.Property == "name":
+			row = append(row, "Alice")
+		default:
+			row = append(row, nil)
+		}
+	}
+	evs := pq.Decoder.Decode(row)
+	var edge *sqlpgq.Event
+	ids := map[string]bool{}
+	for i := range evs {
+		ids[evs[i].ID] = true
+		if evs[i].Kind == sqlpgq.EventEdge {
+			edge = &evs[i]
+		}
+	}
+	if edge == nil {
+		t.Fatalf("no edge event decoded: %+v", evs)
+	}
+	// The edge's endpoints must equal the vertex ids present this row.
+	if !ids[edge.Source] || !ids[edge.Destination] {
+		t.Fatalf("edge endpoints %q/%q do not match any vertex id in %+v", edge.Source, edge.Destination, ids)
+	}
+	if edge.Source != `100:["Alice"]` || edge.Destination != `100:["Bob"]` {
+		t.Fatalf("edge endpoints = %q -> %q, want Alice -> Bob", edge.Source, edge.Destination)
+	}
+}
+
+// keylessGraph builds metadata for a graph that hides its keys: vertex person2
+// KEY (id) PROPERTIES (name) and edge follows KEY (a,b) NO PROPERTIES. Shared by
+// the degraded-path regression tests below.
+func keylessGraph() *sqlpgq.GraphMetadata {
+	return &sqlpgq.GraphMetadata{
+		Graph: sqlpgq.Graph{Schema: "public", Name: "g"},
+		Vertices: []sqlpgq.Element{{
+			OID: 100, Alias: "person2", Kind: "v", PK: []string{"id"},
+			Table:      sqlpgq.TableRef{Schema: "public", Name: "person2"},
+			Labels:     []string{"person"},
+			Properties: []sqlpgq.Property{{Name: "name", Type: "text"}},
+		}},
+		Edges: []sqlpgq.Element{{
+			OID: 200, Alias: "follows", Kind: "e", PK: []string{"a", "b"},
+			Table:       sqlpgq.TableRef{Schema: "public", Name: "follows"},
+			Labels:      []string{"follows"},
+			Source:      &sqlpgq.EdgeEnd{VertexOID: 100, Key: []string{"a"}, Ref: []string{"id"}},
+			Destination: &sqlpgq.EdgeEnd{VertexOID: 100, Key: []string{"b"}, Ref: []string{"id"}},
+		}},
+	}
+}
+
+// TestBuildRecursiveExpansion_RejectsKeylessGraph pins that expansion declines a
+// graph whose KEY isn't exposed as a property, rather than emitting misaligned
+// rows. /query renders such graphs (degraded), but /expand round-trips
+// PK-derived ids and names the hidden columns directly, so it must error
+// cleanly. Regression for the expand decoder/SQL column-misalignment bug.
+func TestBuildRecursiveExpansion_RejectsKeylessGraph(t *testing.T) {
+	md := keylessGraph()
+	anchor := &md.Vertices[0]
+	_, err := sqlpgq.BuildRecursiveExpansion(md, anchor, []string{"1"}, nil, 0, 1)
+	if err == nil {
+		t.Fatal("expected expansion to reject a keyless graph, got nil")
+	}
+	if !strings.Contains(err.Error(), "not exposed as properties") {
+		t.Fatalf("unexpected error text: %v", err)
+	}
+}
+
+// TestBuildProjection_UnresolvableEndpointWarns pins that an edge whose endpoints
+// can be linked neither by value (FK columns not exposed) nor within-row (no
+// bound endpoint vertex) produces a warning and is dropped at decode rather than
+// emitting a dangling edge.
+func TestBuildProjection_UnresolvableEndpointWarns(t *testing.T) {
+	// Edge exposes a non-key property (so the projection has a column to emit and
+	// doesn't trip the "no columns" guard), but its KEY/endpoint columns are
+	// hidden AND the pattern binds no endpoint vertices — so neither linking
+	// scheme can resolve the endpoints.
+	md := &sqlpgq.GraphMetadata{
+		Graph: sqlpgq.Graph{Schema: "public", Name: "g"},
+		Edges: []sqlpgq.Element{{
+			OID: 200, Alias: "follows", Kind: "e", PK: []string{"a", "b"},
+			Table:       sqlpgq.TableRef{Schema: "public", Name: "follows"},
+			Labels:      []string{"follows"},
+			Properties:  []sqlpgq.Property{{Name: "since", Type: "integer"}},
+			Source:      &sqlpgq.EdgeEnd{VertexOID: 100, Key: []string{"a"}, Ref: []string{"id"}},
+			Destination: &sqlpgq.EdgeEnd{VertexOID: 100, Key: []string{"b"}, Ref: []string{"id"}},
+		}},
+	}
+	pq, err := sqlpgq.BuildProjection(md,
+		[]sqlpgq.Binding{{Alias: "k", ElementOID: 200, Label: "follows"}},
+		"()-[k IS follows]->()", "", 0)
+	if err != nil {
+		t.Fatalf("BuildProjection: %v", err)
+	}
+	var warned bool
+	for _, w := range pq.Warnings {
+		if strings.Contains(w, "endpoint can't be resolved") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Fatalf("expected an unresolvable-endpoint warning, got: %v", pq.Warnings)
+	}
+	// Even though the edge has an id (from its property), its endpoints can't be
+	// resolved, so it's dropped at decode — no dangling edge reaches the canvas.
+	if evs := pq.Decoder.Decode([]any{int64(2020)}); len(evs) != 0 {
+		t.Fatalf("expected no events for an unresolvable edge, got %+v", evs)
 	}
 }

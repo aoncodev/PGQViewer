@@ -749,6 +749,19 @@ export function Workspace() {
         // panel can render them.
         if (ev.sql !== undefined) setGenSql(ev.sql);
         if (ev.bindings !== undefined) setGenBindings(ev.bindings);
+        // Non-fatal projection notices (e.g. a KEY column not exposed as a
+        // property, so identity is approximated). A keyless graph can emit one
+        // per degraded binding, so dedup and collapse into a single toast
+        // instead of stacking several.
+        if (ev.warnings && ev.warnings.length > 0) {
+          const unique = [...new Set(ev.warnings)];
+          pushToast(
+            'info',
+            unique.length === 1
+              ? unique[0]!
+              : `${unique.length} projection warnings — ${unique.join(' • ')}`,
+          );
+        }
         break;
       case 'explain':
         flushPending();
