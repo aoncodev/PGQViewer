@@ -176,26 +176,15 @@ describe('matchHint — parser-level syntax-error fallbacks', () => {
 });
 
 describe('matchHint — viewer-synthesized errors (projection.go / introspect.go)', () => {
-  // Mirrors projection.go validateBinding format strings verbatim.
-  it('PK columns not declared as properties', () => {
+  // Mirrors projection.go validateBinding. A KEY column simply not being exposed
+  // as a property NO LONGER errors (the projection degrades to a property-derived
+  // identity); the residual hard error fires only when there's nothing at all to
+  // identify a vertex by.
+  it('vertex with no identifiable column', () => {
     const h = matchHint(
-      'binding "a" (people): PK columns [id] are not declared as properties — recreate the property graph with PROPERTIES ALL COLUMNS or list them in PROPERTIES (...)',
+      'binding "a" (people): the KEY columns [id] are not exposed as properties and the element declares no other property, so the viewer has nothing to identify this vertex by — list at least one column in PROPERTIES (...) (or drop the clause to expose all columns)',
     );
-    expect(h?.title).toBe('Key columns not exposed as properties');
-  });
-
-  it('source key columns not declared as properties', () => {
-    const h = matchHint(
-      'binding "k" (knows): source key columns [src] are not declared as properties',
-    );
-    expect(h?.title).toBe('Key columns not exposed as properties');
-  });
-
-  it('destination key columns not declared as properties', () => {
-    const h = matchHint(
-      'binding "k" (knows): destination key columns [dst] are not declared as properties',
-    );
-    expect(h?.title).toBe('Key columns not exposed as properties');
+    expect(h?.title).toBe('Vertex has no identifiable column');
   });
 
   // Mirrors introspect.go refMismatchDiagnostic format string verbatim.

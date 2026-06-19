@@ -182,8 +182,8 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request) {
 		// rest of the stream (and stash it for cancellation), even when the
 		// body is empty/short.
 		_ = enc.Encode(map[string]any{
-			"type":     "meta",
-			"qid":      qid,
+			"type":        "meta",
+			"qid":         qid,
 			"backend_pid": pid,
 		})
 		flusher.Flush()
@@ -219,6 +219,9 @@ func (s *Server) query(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(projected.Trimmed) > 0 {
 			meta["trimmed"] = projected.Trimmed
+		}
+		if len(projected.Warnings) > 0 {
+			meta["warnings"] = projected.Warnings
 		}
 		_ = enc.Encode(meta)
 		flusher.Flush()

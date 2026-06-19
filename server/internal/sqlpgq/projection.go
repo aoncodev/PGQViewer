@@ -23,9 +23,11 @@ import (
 // DisplayProperties is an optional allow-list narrowing which properties
 // get projected for this binding. Empty (default) projects everything,
 // which preserves the property panel's "show me everything about this
-// vertex" UX. PK and edge-endpoint key columns are always projected
-// regardless, since the synthetic id and endpoint linking need them. A
-// non-empty list lets a renderer (or a power-user hitting the HTTP API
+// vertex" UX. The KEY / edge-endpoint columns are projected regardless of this
+// list when they're exposed as properties (the synthetic id and endpoint
+// linking need them); when a graph hides them, identity degrades to the
+// available columns instead (see the degraded path in BuildProjectionWithOpts).
+// A non-empty list lets a renderer (or a power-user hitting the HTTP API
 // directly) trim wide graphs down to a sane payload size — see todo.md
 // item #6.
 type Binding struct {
@@ -39,6 +41,25 @@ type Binding struct {
 	// pattern `(a)`, or any non-GRAPH_TABLE caller) keeps the full property union,
 	// which PG also accepts.
 	Label string `json:"label,omitempty"`
+	// SourceAlias / DestinationAlias name the vertex aliases this edge connects in the
+	// MATCH pattern (`(a)-[e]->(b)` → SourceAlias "a", DestinationAlias "b"), as parsed
+	// client-side. Set only on edge bindings whose endpoints are both bound
+	// vertices in the same pattern.
+	//
+	// They drive *within-row* endpoint linking: each result row of a GRAPH_TABLE
+	// match co-locates the edge with both its endpoint vertices, so the edge can
+	// borrow those vertices' synthesized ids directly instead of re-deriving them
+	// from its own FK columns. This is what lets the viewer render graphs whose
+	// KEY / endpoint columns are NOT exposed as properties (PG's MATCH already
+	// resolved the topology; the FK values are never needed). When unset — an
+	// anonymous endpoint, an edges-only query, or the /expand path — linking
+	// falls back to the value-based scheme (FK value == referenced PK value).
+	//
+	// For a graph that DOES expose its keys the two schemes produce byte-identical
+	// ids (FK value == PK value), so setting these never changes a valid graph's
+	// output; it only adds a fallback for the keyless case.
+	SourceAlias      string `json:"source_alias,omitempty"`
+	DestinationAlias string `json:"destination_alias,omitempty"`
 }
 
 // ProjectedQuery is the result of BuildProjection.
@@ -68,6 +89,13 @@ type ProjectedQuery struct {
 	Params    []any
 	ColumnMap []ColumnMapping
 	Trimmed   []TrimInfo
+	// Warnings carries non-fatal degradation notices produced while building the
+	// projection — today, the "this element's KEY isn't exposed as a property, so
+	// identity is approximated from its other columns" case (see validateBinding
+	// / the degraded-identity path in BuildProjectionWithOpts). The caller
+	// surfaces them in the meta event so the user understands why dedup might
+	// merge distinct nodes/edges. Empty in the happy path.
+	Warnings []string
 }
 
 // ColumnMapping translates one synthetic COLUMNS alias (e.g. "a__p__name")
@@ -239,6 +267,15 @@ func BuildProjectionWithOpts(opts ProjectionOpts) (*ProjectedQuery, error) {
 	var cols []string
 	var colMap []ColumnMapping
 	var trimmed []TrimInfo
+	var warnings []string
+	// boundVertices lets an edge tell whether its pattern endpoints are bound
+	// vertex aliases in THIS query — the precondition for within-row linking.
+	boundVertices := map[string]bool{}
+	for _, b := range sorted {
+		if el, ok := byOID[b.ElementOID]; ok && el.Kind == "v" {
+			boundVertices[b.Alias] = true
+		}
+	}
 	dec := &RowDecoder{
 		Bindings: make([]decoderBinding, 0, len(sorted)),
 	}
@@ -276,12 +313,21 @@ func BuildProjectionWithOpts(opts ProjectionOpts) (*ProjectedQuery, error) {
 			Labels:     append([]string(nil), el.Labels...),
 		}
 
-		// PK columns — always projected. Position recorded in pkCols for
-		// the decoder to assemble the synthetic id.
-		for _, c := range el.PK {
-			out := b.Alias + sep + prefixPK + sep + c
-			propName, _ := propertyForColumn(el, c)
-			db.pkCols = append(db.pkCols, addCol(b.Alias, propName, out, prefixPK))
+		// KEY columns. The decoder synthesizes element identity from these, so
+		// the ideal is to project them (they're always exposed as properties
+		// under PG's default `PROPERTIES ALL COLUMNS`) and use them as idCols.
+		// When a graph explicitly omits a KEY column from PROPERTIES, SQL/PGQ
+		// won't let us name it inside COLUMNS — so we DON'T project it (that would
+		// emit invalid SQL) and instead fall back to a property-derived identity
+		// below. PG itself can still run such a graph; we match that rather than
+		// refusing it.
+		keysExposed := len(missingKeyProperties(el, el.PK)) == 0
+		if keysExposed {
+			for _, c := range el.PK {
+				out := b.Alias + sep + prefixPK + sep + c
+				propName, _ := propertyForColumn(el, c)
+				db.idCols = append(db.idCols, addCol(b.Alias, propName, out, prefixPK))
+			}
 		}
 
 		// Properties. Apply the optional DisplayProperties allow-list:
@@ -296,6 +342,13 @@ func BuildProjectionWithOpts(opts ProjectionOpts) (*ProjectedQuery, error) {
 		// column) instead of projecting everything. PK and edge keys are
 		// still always projected (handled outside this loop), and the
 		// trim is recorded so the client can request the full set.
+		//
+		// The trim is skipped for a DEGRADED element (KEY not exposed): there,
+		// identity is synthesized from the projected property columns (below), so
+		// trimming them to one heuristic column would collapse identity onto a
+		// typically-non-unique value and silently merge distinct nodes/edges. A
+		// wide+keyless element is rare; projecting its full property set keeps
+		// dedup as accurate as the data allows.
 		// F3: scope to the matched label. PG19 binds an element variable to the
 		// label named in the pattern, and `a.<prop>` is valid only for a property
 		// of that label. The client sends the parsed label; an empty Label
@@ -307,7 +360,7 @@ func BuildProjectionWithOpts(opts ProjectionOpts) (*ProjectedQuery, error) {
 
 		effectiveDisplay := b.DisplayProperties
 		var didTrim bool
-		if len(effectiveDisplay) == 0 && len(scopedProps) > wideElementPropertyThreshold {
+		if len(effectiveDisplay) == 0 && keysExposed && len(scopedProps) > wideElementPropertyThreshold {
 			effectiveDisplay = heuristicDisplayProperties(scopedProps)
 			didTrim = true
 		}
@@ -334,25 +387,56 @@ func BuildProjectionWithOpts(opts ProjectionOpts) (*ProjectedQuery, error) {
 			})
 		}
 
-		// Edge source / destination key columns. We project the key columns
-		// of the *edge* table — those values equal the corresponding PK
-		// values of the source / destination vertex (FK = referenced PK).
+		// When the KEY columns weren't exposed, idCols is still empty (the block
+		// above only fills it for keysExposed). Fall back to the projected
+		// property columns so the element still renders — dedup then merges rows
+		// with identical visible properties, which we warn about.
+		if !keysExposed {
+			for _, p := range db.propCols {
+				db.idCols = append(db.idCols, p.idx)
+			}
+			warnings = append(warnings, degradedIdentityWarning(b.Alias, el))
+		}
+
+		// Edge source / destination key columns. When the FK columns are exposed
+		// as properties we project them for value-based linking (FK value ==
+		// referenced PK value) — the scheme that also lets /expand stitch edges to
+		// vertices it fetched in an earlier query. When they're NOT exposed we
+		// rely on within-row linking instead: SourceAlias / DestinationAlias point at the
+		// endpoint vertex bindings, and the decoder borrows their ids straight from
+		// the same result row (PG's MATCH already resolved the topology).
 		if el.Kind == "e" {
 			if el.Source != nil {
-				for _, c := range el.Source.Key {
-					out := b.Alias + sep + prefixSK + sep + c
-					propName, _ := propertyForColumn(el, c)
-					db.srcKeyCols = append(db.srcKeyCols, addCol(b.Alias, propName, out, prefixSK))
+				if len(missingKeyProperties(el, el.Source.Key)) == 0 {
+					for _, c := range el.Source.Key {
+						out := b.Alias + sep + prefixSK + sep + c
+						propName, _ := propertyForColumn(el, c)
+						db.srcKeyCols = append(db.srcKeyCols, addCol(b.Alias, propName, out, prefixSK))
+					}
+					db.srcVertexOID = el.Source.VertexOID
 				}
-				db.srcVertexOID = el.Source.VertexOID
+				if boundVertices[b.SourceAlias] {
+					db.srcAlias = b.SourceAlias
+				}
+				if db.srcVertexOID == 0 && db.srcAlias == "" {
+					warnings = append(warnings, unresolvableEndpointWarning(b.Alias, "source"))
+				}
 			}
 			if el.Destination != nil {
-				for _, c := range el.Destination.Key {
-					out := b.Alias + sep + prefixDK + sep + c
-					propName, _ := propertyForColumn(el, c)
-					db.dstKeyCols = append(db.dstKeyCols, addCol(b.Alias, propName, out, prefixDK))
+				if len(missingKeyProperties(el, el.Destination.Key)) == 0 {
+					for _, c := range el.Destination.Key {
+						out := b.Alias + sep + prefixDK + sep + c
+						propName, _ := propertyForColumn(el, c)
+						db.dstKeyCols = append(db.dstKeyCols, addCol(b.Alias, propName, out, prefixDK))
+					}
+					db.dstVertexOID = el.Destination.VertexOID
 				}
-				db.dstVertexOID = el.Destination.VertexOID
+				if boundVertices[b.DestinationAlias] {
+					db.dstAlias = b.DestinationAlias
+				}
+				if db.dstVertexOID == 0 && db.dstAlias == "" {
+					warnings = append(warnings, unresolvableEndpointWarning(b.Alias, "destination"))
+				}
 			}
 		}
 
@@ -373,51 +457,66 @@ func BuildProjectionWithOpts(opts ProjectionOpts) (*ProjectedQuery, error) {
 		Params:    opts.Params,
 		ColumnMap: colMap,
 		Trimmed:   trimmed,
+		Warnings:  warnings,
 	}, nil
 }
 
-// validateBinding rejects a binding the projection cannot honour: an element
-// carrying an error-severity diagnostic, or one whose PK / edge-endpoint key
-// columns are not declared as properties.
+// validateBinding rejects a binding the projection genuinely cannot honour: an
+// element carrying an error-severity diagnostic, or a vertex with no way at all
+// to form an identity.
 //
 // Warning-severity diagnostics (e.g. non-unique KEY) flow through unblocked —
 // they're surfaced via the metadata so the UI can render an advisory banner.
 //
-// The key-column rule exists because SQL/PGQ only allows declared properties
-// in COLUMNS, and the projection synthesizes element identity from PK / FK
-// column values, so those columns must be exposed as properties.
+// A KEY column that isn't exposed as a property is NOT rejected here: SQL/PGQ
+// won't let us name it in COLUMNS, but PG can still run the graph, so the
+// projection degrades to a property-derived identity (see the degraded path in
+// BuildProjectionWithOpts) rather than refusing. The one irrecoverable case is a
+// vertex whose KEY is unexposed AND that declares no properties either — there
+// is then literally no column to identify it by, so it can't be placed on the
+// canvas. PG can't surface those columns to a query either; this stays an error.
 func validateBinding(b Binding, el *Element) error {
 	for _, d := range el.Diagnostics {
 		if d.Severity == "error" {
 			return fmt.Errorf("binding %q (%s): %s", b.Alias, el.Alias, d.Message)
 		}
 	}
-	if missing := missingKeyProperties(el, el.PK); len(missing) > 0 {
+	if el.Kind == "v" && len(missingKeyProperties(el, el.PK)) > 0 && len(el.Properties) == 0 {
 		return fmt.Errorf(
-			"binding %q (%s): PK columns %v are not declared as properties — recreate the property graph with PROPERTIES ALL COLUMNS or list them in PROPERTIES (...)",
-			b.Alias, el.Alias, missing,
+			"binding %q (%s): the KEY columns %v are not exposed as properties and the element declares no other property, so the viewer has nothing to identify this vertex by — list at least one column in PROPERTIES (...) (or drop the clause to expose all columns)",
+			b.Alias, el.Alias, el.PK,
 		)
 	}
-	if el.Kind != "e" {
-		return nil
-	}
-	if el.Source != nil {
-		if missing := missingKeyProperties(el, el.Source.Key); len(missing) > 0 {
-			return fmt.Errorf(
-				"binding %q (%s): source key columns %v are not declared as properties",
-				b.Alias, el.Alias, missing,
-			)
-		}
-	}
-	if el.Destination != nil {
-		if missing := missingKeyProperties(el, el.Destination.Key); len(missing) > 0 {
-			return fmt.Errorf(
-				"binding %q (%s): destination key columns %v are not declared as properties",
-				b.Alias, el.Alias, missing,
-			)
-		}
-	}
 	return nil
+}
+
+// degradedIdentityWarning is emitted when an element's KEY columns are not
+// exposed as properties, so identity is approximated from whatever columns ARE
+// exposed (or, for a property-less edge, from its resolved endpoints). The
+// canvas still renders; the caveat is that two rows the viewer can't tell apart
+// collapse into one node/edge.
+func degradedIdentityWarning(alias string, el *Element) string {
+	return fmt.Sprintf(
+		"%s %q: KEY column(s) %s are not exposed as properties; identity is approximated from the columns that are, so rows with identical visible values merge into one element. Add %s to PROPERTIES (...) (or drop the clause to expose all columns) for exact dedup.",
+		elementKindNoun(el.Kind), alias, formatColList(el.PK), formatColList(el.PK),
+	)
+}
+
+// unresolvableEndpointWarning is emitted for an edge endpoint that can be linked
+// neither by value (its FK columns aren't exposed) nor within-row (the pattern
+// doesn't bind that endpoint vertex), so the edge may render detached.
+func unresolvableEndpointWarning(alias, side string) string {
+	return fmt.Sprintf(
+		"edge %q: its %s endpoint can't be resolved — the FK columns aren't exposed as properties and the pattern doesn't bind that endpoint vertex, so the edge may render without its %s. Bind the %s vertex in the MATCH, or expose the FK columns in PROPERTIES (...).",
+		alias, side, side, side,
+	)
+}
+
+func elementKindNoun(kind string) string {
+	if kind == "e" {
+		return "edge"
+	}
+	return "vertex"
 }
 
 // graphTableBlock renders the GRAPH_TABLE (...) expression shared by the
@@ -487,14 +586,27 @@ type RowDecoder struct {
 }
 
 type decoderBinding struct {
-	Alias        string   `json:"alias"`
-	ElementOID   uint32   `json:"element_oid"`
-	Kind         string   `json:"kind"`
-	Labels       []string `json:"labels"`
-	pkCols       []int    // column indices (in the streamed row) for PK
-	propCols     []propRef
-	srcKeyCols   []int
-	dstKeyCols   []int
+	Alias      string   `json:"alias"`
+	ElementOID uint32   `json:"element_oid"`
+	Kind       string   `json:"kind"`
+	Labels     []string `json:"labels"`
+	propCols   []propRef
+	srcKeyCols []int
+	dstKeyCols []int
+	// idCols are the streamed-row column indices whose values synthesize this
+	// element's identity. The common case is the KEY columns (exposed as
+	// properties). When the KEY columns are NOT exposed as properties the element
+	// is "degraded": idCols falls back to the projected property columns so the
+	// element still gets a stable id (dedup is then best-effort — two rows with
+	// identical visible properties merge). An edge with neither projectable keys
+	// nor properties has empty idCols and derives its id from its resolved
+	// endpoints instead (see DecodeRaw).
+	idCols []int
+	// srcAlias / dstAlias name the endpoint vertex bindings for within-row
+	// linking (see Binding.SourceAlias). Empty falls back to value-based linking
+	// via srcKeyCols / dstKeyCols.
+	srcAlias     string
+	dstAlias     string
 	srcVertexOID uint32 // edges only: oid of the source vertex element
 	dstVertexOID uint32 // edges only: oid of the destination vertex element
 }
@@ -550,41 +662,105 @@ func (d *RowDecoder) Decode(values []any) []Event {
 // from the raw pgtype values (where formatPKPart canonicalizes them) keeps the
 // two sides equal. idVals and propVals must be index-compatible.
 //
-// If any PK value is NULL for a binding (outer-join-shaped matches — not in v0
-// PG19, but defensive), the binding is skipped.
+// If any identity value is NULL for a binding (outer-join-shaped matches — not
+// in v0 PG19, but defensive), the binding is skipped.
+//
+// Linking runs in two passes because an edge may borrow its endpoint ids from
+// the vertex bindings in the SAME row (within-row linking — see
+// Binding.SourceAlias). Pass 1 synthesizes every element's own id; pass 2 builds
+// events, resolving edge endpoints against the pass-1 map and falling back to
+// the value-based scheme (FK value == referenced PK value) when no within-row
+// endpoint is available.
 func (d *RowDecoder) DecodeRaw(idVals, propVals []any) []Event {
+	// Pass 1: each element's own identity from its idCols (KEY columns when
+	// exposed, else the projected property columns). A property-less edge has no
+	// idCols and is absent here; it derives an id from its endpoints in pass 2.
+	rowID := make(map[string]string, len(d.Bindings))
+	for _, b := range d.Bindings {
+		if k, ok := joinKey(idVals, b.idCols); ok {
+			rowID[b.Alias] = fmt.Sprintf("%d:%s", b.ElementOID, k)
+		}
+	}
+
 	out := make([]Event, 0, len(d.Bindings))
 	for _, b := range d.Bindings {
-		pk, ok := joinKey(idVals, b.pkCols)
-		if !ok {
-			continue
-		}
-		ev := Event{
-			Binding:    b.Alias,
-			Labels:     b.Labels,
-			Properties: make(map[string]any, len(b.propCols)),
-			ID:         fmt.Sprintf("%d:%s", b.ElementOID, pk),
-		}
-		for _, p := range b.propCols {
-			ev.Properties[p.name] = propVals[p.idx]
-		}
 		switch b.Kind {
 		case "v":
-			ev.Kind = EventVertex
+			id, ok := rowID[b.Alias]
+			if !ok {
+				continue
+			}
+			out = append(out, b.baseEvent(id, propVals, EventVertex))
 		case "e":
-			ev.Kind = EventEdge
-			if sk, ok := joinKey(idVals, b.srcKeyCols); ok && b.srcVertexOID != 0 {
-				ev.Source = fmt.Sprintf("%d:%s", b.srcVertexOID, sk)
+			src := b.resolveEndpoint(b.srcAlias, b.srcKeyCols, b.srcVertexOID, rowID, idVals)
+			dst := b.resolveEndpoint(b.dstAlias, b.dstKeyCols, b.dstVertexOID, rowID, idVals)
+			// An edge needs both endpoints to attach to the canvas; emitting one
+			// with a blank source/destination would be a dangling edge the
+			// renderer can't place. Skip it — the build-time
+			// unresolvableEndpointWarning explains the persistent case (FK columns
+			// not exposed and the endpoint vertex not bound in the pattern).
+			if src == "" || dst == "" {
+				continue
 			}
-			if dk, ok := joinKey(idVals, b.dstKeyCols); ok && b.dstVertexOID != 0 {
-				ev.Destination = fmt.Sprintf("%d:%s", b.dstVertexOID, dk)
+			id, ok := rowID[b.Alias]
+			if !ok {
+				// Property-less edge whose KEY isn't exposed (e.g. NO PROPERTIES +
+				// a restricted KEY): identify it by its endpoints. Parallel edges
+				// between the same pair then merge — covered by the degraded warning.
+				id = fmt.Sprintf("%d:%s", b.ElementOID, encodeParts(src, dst))
 			}
-		default:
-			continue
+			ev := b.baseEvent(id, propVals, EventEdge)
+			ev.Source = src
+			ev.Destination = dst
+			out = append(out, ev)
 		}
-		out = append(out, ev)
 	}
 	return out
+}
+
+// baseEvent builds the per-binding event shell (id, labels, properties, kind).
+func (b decoderBinding) baseEvent(id string, propVals []any, kind EventKind) Event {
+	ev := Event{
+		Kind:       kind,
+		Binding:    b.Alias,
+		Labels:     b.Labels,
+		Properties: make(map[string]any, len(b.propCols)),
+		ID:         id,
+	}
+	for _, p := range b.propCols {
+		ev.Properties[p.name] = propVals[p.idx]
+	}
+	return ev
+}
+
+// resolveEndpoint returns the id of one edge endpoint. It prefers within-row
+// linking — the endpoint vertex binding's own id from this row, which is correct
+// regardless of whether any KEY column is exposed. It falls back to the
+// value-based scheme (the edge's projected FK columns formatted against the
+// referenced vertex element oid) for anonymous endpoints, edges-only queries,
+// and the /expand path. Returns "" when neither is available.
+func (b decoderBinding) resolveEndpoint(alias string, keyCols []int, vertexOID uint32, rowID map[string]string, idVals []any) string {
+	if alias != "" {
+		if id, ok := rowID[alias]; ok {
+			return id
+		}
+	}
+	if vertexOID != 0 {
+		if k, ok := joinKey(idVals, keyCols); ok {
+			return fmt.Sprintf("%d:%s", vertexOID, k)
+		}
+	}
+	return ""
+}
+
+// encodeParts joins strings into the same collision-free JSON-array form joinKey
+// uses, so an endpoint-derived edge id can't alias a differently-split pair.
+func encodeParts(parts ...string) string {
+	out, err := json.Marshal(parts)
+	if err != nil {
+		return ""
+	}
+	return string(out)
 }
 
 // joinKey produces a stable, unambiguous string from the values at the
