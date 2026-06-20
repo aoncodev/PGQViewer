@@ -9,7 +9,7 @@
 # network only.
 
 # ---- stage 1: renderer bundle ------------------------------------------------
-FROM node:22-bookworm-slim AS web
+FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS web
 
 # apps/renderer is a self-contained pnpm workspace (own lockfile).
 RUN corepack enable && corepack prepare pnpm@11.0.9 --activate
@@ -22,7 +22,7 @@ COPY apps/renderer/ ./
 RUN pnpm build
 
 # ---- stage 2: Go binary with embedded UI --------------------------------------
-FROM golang:1.25-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.25-bookworm AS build
 
 WORKDIR /src/server
 COPY server/go.mod server/go.sum ./
@@ -30,7 +30,13 @@ RUN go mod download
 
 COPY server/ ./
 COPY --from=web /src/renderer/dist/ internal/webui/dist/
-RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/pgqviewer-server ./cmd/pgqviewer-server
+
+# Cross-compile for the target arch (CGO disabled — deps are pure Go), so the
+# multi-arch image builds on the native runner instead of emulating the whole
+# toolchain under QEMU.
+ARG TARGETOS TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags='-s -w' -o /out/pgqviewer-server ./cmd/pgqviewer-server
 
 # ---- stage 3: runtime ----------------------------------------------------------
 FROM alpine:3.21
